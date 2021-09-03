@@ -56,6 +56,7 @@ include $(HTSDIR)/htslib_vars.mk
 
 HTSLIB_PUBLIC_HEADERS = \
 	$(HTSSRCDIR)/htslib/bgzf.h \
+	$(HTSSRCDIR)/htslib/bzstdf.h \
 	$(HTSSRCDIR)/htslib/cram.h \
 	$(HTSSRCDIR)/htslib/faidx.h \
 	$(HTSSRCDIR)/htslib/hfile.h \

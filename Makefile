@@ -67,7 +67,8 @@ plugindir =
 BUILT_PROGRAMS = \
 	bgzip \
 	htsfile \
-	tabix
+	tabix \
+	bzstd
 
 BUILT_TEST_PROGRAMS = \
 	test/hts_endian \
@@ -412,6 +413,9 @@ htscodecs/htscodecs/tokenise_name3.o htscodecs/htscodecs/tokenise_name3.pico: ht
 bgzip: bgzip.o libhts.a
 	$(CC) $(LDFLAGS) -o $@ bgzip.o libhts.a $(LIBS) -lpthread
 
+bzstd: bzstd.o libhts.a
+	$(CC) $(LDFLAGS) -o $@ bzstd.o libhts.a $(LIBS) -lpthread
+
 htsfile: htsfile.o libhts.a
 	$(CC) $(LDFLAGS) -o $@ htsfile.o libhts.a $(LIBS) -lpthread
 
@@ -419,6 +423,7 @@ tabix: tabix.o libhts.a
 	$(CC) $(LDFLAGS) -o $@ tabix.o libhts.a $(LIBS) -lpthread
 
 bgzip.o: bgzip.c config.h $(htslib_bgzf_h) $(htslib_hts_h)
+bzstd.o: bzstd.c config.h $(htslib_bzstdf_h) $(htslib_hts_h)
 htsfile.o: htsfile.c config.h $(htslib_hfile_h) $(htslib_hts_h) $(htslib_sam_h) $(htslib_vcf_h)
 tabix.o: tabix.c config.h $(htslib_tbx_h) $(htslib_sam_h) $(htslib_vcf_h) $(htslib_kseq_h) $(htslib_bgzf_h) $(htslib_hts_h) $(htslib_regidx_h) $(htslib_hts_defs_h) $(htslib_hts_log_h)
 

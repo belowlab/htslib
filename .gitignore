@@ -42,6 +42,7 @@ header-exports.txt
 shlib-exports-*.txt
 
 /bgzip
+/bzstd
 /htsfile
 /tabix
 /test/fieldarith
@@ -75,3 +76,5 @@ shlib-exports-*.txt
 /test/*.tmp.*
 
 /TAGS
+
+.idea/

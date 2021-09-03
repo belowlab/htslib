@@ -38,6 +38,7 @@ a development ('-dev' or '-devel') package separate from the main library.
     liblzma    (required, unless configured with --disable-lzma)
     libcurl    (optional, but strongly recommended)
     libcrypto  (optional for Amazon S3 support; not needed on MacOS)
+    libzstd    (optional for bzstdf & bzstd)
 
 Disabling libbzip2 and liblzma will make some CRAM files unreadable, so
 is not recommended.
