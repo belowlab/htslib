@@ -41,6 +41,11 @@
 #include <libdeflate.h>
 #endif
 
+#define HAVE_LIBZSTD
+#ifdef HAVE_LIBZSTD
+#include "zstd.h"
+#endif
+
 #include "htslib/hts.h"
 #include "htslib/bzstdf.h"
 #include "htslib/hfile.h"
@@ -624,38 +629,12 @@ int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int 
         *dlen = slen+5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
     } else {
         // compress the body
-        zs.zalloc = NULL; zs.zfree = NULL;
-        zs.msg = NULL;
-        zs.next_in  = (Bytef*)src;
-        zs.avail_in = slen;
-        zs.next_out = dst + BLOCK_HEADER_LENGTH;
-        zs.avail_out = *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH;
-        int ret = deflateInit2(&zs, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY); // -15 to disable zlib header/footer
-        if (ret!=Z_OK) {
-            hts_log_error("Call to deflateInit2 failed: %s", bzstdf_zerr(ret, &zs));
+        size_t result = ZSTD_compress(_dst, *dlen, src, slen, level);
+
+        if (ZSTD_isError(result)) {
+            hts_log_error("Died during zstd compression");
             return -1;
         }
-        if ((ret = deflate(&zs, Z_FINISH)) != Z_STREAM_END) {
-            if (ret == Z_OK && zs.avail_out == 0) {
-                deflateEnd(&zs);
-                goto uncomp;
-            } else {
-                hts_log_error("Deflate operation failed: %s", bzstdf_zerr(ret, ret == Z_DATA_ERROR ? &zs : NULL));
-            }
-            return -1;
-        }
-        // If we used up the entire output buffer, then we either ran out of
-        // room or we *just* fitted, but either way we may as well store
-        // uncompressed for faster decode.
-        if (zs.avail_out == 0) {
-            deflateEnd(&zs);
-            goto uncomp;
-        }
-        if ((ret = deflateEnd(&zs)) != Z_OK) {
-            hts_log_error("Call to deflateEnd failed: %s", bzstdf_zerr(ret, NULL));
-            return -1;
-        }
-        *dlen = zs.total_out + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
     }
 
     // write the header
