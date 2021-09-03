@@ -173,6 +173,7 @@ LIBHTS_OBJS = \
 	kstring.o \
 	bcf_sr_sort.o \
 	bgzf.o \
+	bzstdf.o \
 	errmod.o \
 	faidx.o \
 	header.o \
@@ -358,6 +359,7 @@ hts-object-files: $(LIBHTS_OBJS)
 
 
 bgzf.o bgzf.pico: bgzf.c config.h $(htslib_hts_h) $(htslib_bgzf_h) $(htslib_hfile_h) $(htslib_thread_pool_h) $(htslib_hts_endian_h) cram/pooled_alloc.h $(hts_internal_h) $(htslib_khash_h)
+bzstdf.o bzstdf.pico: bzstdf.c config.h $(htslib_hts_h) $(htslib_bzstdf_h) $(htslib_hfile_h) $(htslib_thread_pool_h) $(htslib_hts_endian_h) cram/pooled_alloc.h $(hts_internal_h) $(htslib_khash_h)
 errmod.o errmod.pico: errmod.c config.h $(htslib_hts_h) $(htslib_ksort_h) $(htslib_hts_os_h)
 kstring.o kstring.pico: kstring.c config.h $(htslib_kstring_h)
 header.o header.pico: header.c config.h $(textutils_internal_h) $(header_h)

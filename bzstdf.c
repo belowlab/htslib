@@ -3,7 +3,6 @@
    Copyright (c) 2008 Broad Institute / Massachusetts Institute of Technology
                  2011, 2012 Attractive Chaos <attractor@live.co.uk>
    Copyright (C) 2009, 2013-2021 Genome Research Ltd
-   Copyright (c) Vanderbilt University Medical Center 2021
 
    Permission is hereby granted, free of charge, to any person obtaining a copy
    of this software and associated documentation files (the "Software"), to deal
@@ -24,9 +23,6 @@
    THE SOFTWARE.
 */
 
-#include "htslib/bzstdf.h" // The new import
-
-// All below is from bgzf.c
 #define HTS_BUILDING_LIBRARY // Enables HTSLIB_EXPORT, see htslib/hts_defs.h
 #include <config.h>
 
@@ -46,7 +42,7 @@
 #endif
 
 #include "htslib/hts.h"
-#include "htslib/bgzf.h"
+#include "htslib/bzstdf.h"
 #include "htslib/hfile.h"
 #include "htslib/thread_pool.h"
 #include "htslib/hts_endian.h"
@@ -57,33 +53,116 @@
 #define EFTYPE ENOEXEC
 #endif
 
-#define BGZF_CACHE
-#define BGZF_MT
+#define BZSTDF_CACHE
+#define BZSTDF_MT
 
 #define BLOCK_HEADER_LENGTH 18
 #define BLOCK_FOOTER_LENGTH 8
 
 
-/* BGZF/GZIP header (specialized from RFC 1952; little endian):
+/* BZSTDF/GZIP header (specialized from RFC 1952; little endian):
  +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
  | 31|139|  8|  4|              0|  0|255|      6| 66| 67|      2|BLK_LEN|
  +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
-  BGZF extension:
+  BZSTDF extension:
                 ^                              ^   ^   ^
                 |                              |   |   |
                FLG.EXTRA                     XLEN  B   C
 
-  BGZF format is compatible with GZIP. It limits the size of each compressed
+  BZSTDF format is compatible with GZIP. It limits the size of each compressed
   block to 2^16 bytes and adds and an extra "BC" field in the gzip header which
   records the size.
 
 */
 static const uint8_t g_magic[19] = "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\0\0";
 
-struct bgzf_cache_t {
+#ifdef BZSTDF_CACHE
+typedef struct {
+    int size;
+    uint8_t *block;
+    int64_t end_offset;
+} cache_t;
+
+#include "htslib/khash.h"
+KHASH_MAP_INIT_INT64(cache, cache_t)
+#endif
+
+struct bzstdf_cache_t {
     khash_t(cache) *h;
     khint_t last_pos;
 };
+
+#ifdef BZSTDF_MT
+
+typedef struct bzstdf_job {
+    BZSTDF *fp;
+    unsigned char comp_data[BZSTDF_MAX_BLOCK_SIZE];
+    size_t comp_len;
+    unsigned char uncomp_data[BZSTDF_MAX_BLOCK_SIZE];
+    size_t uncomp_len;
+    int errcode;
+    int64_t block_address;
+    int hit_eof;
+} bzstdf_job;
+
+enum mtaux_cmd {
+    NONE = 0,
+    SEEK,
+    SEEK_DONE,
+    HAS_EOF,
+    HAS_EOF_DONE,
+    CLOSE,
+};
+
+// When multi-threaded bzstdf_tell won't work, so we delay the hts_idx_push
+// until we've written the last block.
+typedef struct {
+    hts_pos_t beg, end;
+    int tid, is_mapped;  // args for hts_idx_push
+    uint64_t offset, block_number;
+} hts_idx_cache_entry;
+
+typedef struct {
+    int nentries, mentries; // used and allocated
+    hts_idx_cache_entry *e; // hts_idx elements
+} hts_idx_cache_t;
+
+typedef struct bzstdf_mtaux_t {
+    // Memory pool for bzstdf_job structs, to avoid many malloc/free
+    pool_alloc_t *job_pool;
+    bzstdf_job *curr_job;
+
+    // Thread pool
+    int n_threads;
+    int own_pool;
+    hts_tpool *pool;
+
+    // Output queue holding completed bzstdf_jobs
+    hts_tpool_process *out_queue;
+
+    // I/O thread.
+    pthread_t io_task;
+    pthread_mutex_t job_pool_m;
+    int jobs_pending; // number of jobs waiting
+    int flush_pending;
+    void *free_block;
+    int hit_eof;  // r/w entirely within main thread
+
+    // Message passing to the reader thread; eg seek requests
+    int errcode;
+    uint64_t block_address;
+    int eof;
+    pthread_mutex_t command_m; // Set whenever fp is being updated
+    pthread_cond_t command_c;
+    enum mtaux_cmd command;
+
+    // For multi-threaded on-the-fly indexing. See bzstdf_idx_push below.
+    pthread_mutex_t idx_m;
+    hts_idx_t *hts_idx;
+    uint64_t block_number, block_written;
+    hts_idx_cache_t idx_cache;
+} mtaux_t;
+#endif
 
 typedef struct
 {
@@ -112,7 +191,7 @@ struct bgzidx_t
  * Returns 0 on success,
  *        -1 on failure
  */
-int bgzf_idx_push(BGZF *fp, hts_idx_t *hidx, int tid, hts_pos_t beg, hts_pos_t end, uint64_t offset, int is_mapped) {
+int bzstdf_idx_push(BZSTDF *fp, hts_idx_t *hidx, int tid, hts_pos_t beg, hts_pos_t end, uint64_t offset, int is_mapped) {
     hts_idx_cache_entry *e;
     mtaux_t *mt = fp->mt;
 
@@ -152,7 +231,7 @@ int bgzf_idx_push(BGZF *fp, hts_idx_t *hidx, int tid, hts_pos_t beg, hts_pos_t e
 }
 
 /*
- * bgzf analogue to hts_idx_amend_last.
+ * bzstdf analogue to hts_idx_amend_last.
  *
  * This is needed when multi-threading and writing indices on the fly.
  * At the point of writing a record we know the virtual offset for start
@@ -162,10 +241,10 @@ int bgzf_idx_push(BGZF *fp, hts_idx_t *hidx, int tid, hts_pos_t beg, hts_pos_t e
  * detect this boundary case and fix it up here.
  *
  * In theory this has no behavioural change, but it also works around
- * a bug elsewhere which causes bgzf_read to return 0 when our offset
+ * a bug elsewhere which causes bzstdf_read to return 0 when our offset
  * is the end of a block rather than the start of the next.
  */
-void bgzf_idx_amend_last(BGZF *fp, hts_idx_t *hidx, uint64_t offset) {
+void bzstdf_idx_amend_last(BZSTDF *fp, hts_idx_t *hidx, uint64_t offset) {
     mtaux_t *mt = fp->mt;
     if (!mt) {
         hts_idx_amend_last(hidx, offset);
@@ -185,7 +264,7 @@ void bgzf_idx_amend_last(BGZF *fp, hts_idx_t *hidx, uint64_t offset) {
     pthread_mutex_unlock(&mt->idx_m);
 }
 
-static int bgzf_idx_flush(BGZF *fp) {
+static int bzstdf_idx_flush(BZSTDF *fp) {
     mtaux_t *mt = fp->mt;
 
     if (!mt->idx_cache.e) {
@@ -217,8 +296,8 @@ static int bgzf_idx_flush(BGZF *fp) {
     return 0;
 }
 
-void bgzf_index_destroy(BGZF *fp);
-int bgzf_index_add_block(BGZF *fp);
+void bzstdf_index_destroy(BZSTDF *fp);
+int bzstdf_index_add_block(BZSTDF *fp);
 static int mt_destroy(mtaux_t *mt);
 
 static inline void packInt16(uint8_t *buffer, uint16_t value)
@@ -271,7 +350,7 @@ static void razf_info(hFILE *hfp, const char *filename)
             "usually be safely ignored.", filename);
 }
 
-static const char *bgzf_zerr(int errnum, z_stream *zs)
+static const char *bzstdf_zerr(int errnum, z_stream *zs)
 {
     static char buffer[32];
 
@@ -308,20 +387,20 @@ static const char *bgzf_zerr(int errnum, z_stream *zs)
     }
 }
 
-static BGZF *bgzf_read_init(hFILE *hfpr, const char *filename)
+static BZSTDF *bzstdf_read_init(hFILE *hfpr, const char *filename)
 {
-    BGZF *fp;
+    BZSTDF *fp;
     uint8_t magic[18];
     ssize_t n = hpeek(hfpr, magic, 18);
     if (n < 0) return NULL;
 
-    fp = (BGZF*)calloc(1, sizeof(BGZF));
+    fp = (BZSTDF*)calloc(1, sizeof(BZSTDF));
     if (fp == NULL) return NULL;
 
     fp->is_write = 0;
-    fp->uncompressed_block = malloc(2 * BGZF_MAX_BLOCK_SIZE);
+    fp->uncompressed_block = malloc(2 * BZSTDF_MAX_BLOCK_SIZE);
     if (fp->uncompressed_block == NULL) { free(fp); return NULL; }
-    fp->compressed_block = (char *)fp->uncompressed_block + BGZF_MAX_BLOCK_SIZE;
+    fp->compressed_block = (char *)fp->uncompressed_block + BZSTDF_MAX_BLOCK_SIZE;
     fp->is_compressed = (n==18 && magic[0]==0x1f && magic[1]==0x8b);
     fp->is_gzip = ( !fp->is_compressed || ((magic[3]&4) && memcmp(&magic[12], "BC\2\0",4)==0) ) ? 0 : 1;
     if (fp->is_compressed && (magic[3]&4) && memcmp(&magic[12], "RAZF", 4)==0) {
@@ -332,7 +411,20 @@ static BGZF *bgzf_read_init(hFILE *hfpr, const char *filename)
         errno = EFTYPE;
         return NULL;
     }
-
+#ifdef BZSTDF_CACHE
+    if (!(fp->cache = malloc(sizeof(*fp->cache)))) {
+        free(fp->uncompressed_block);
+        free(fp);
+        return NULL;
+    }
+    if (!(fp->cache->h = kh_init(cache))) {
+        free(fp->uncompressed_block);
+        free(fp->cache);
+        free(fp);
+        return NULL;
+    }
+    fp->cache->last_pos = 0;
+#endif
     return fp;
 }
 
@@ -346,10 +438,10 @@ static int mode2level(const char *mode)
     if (strchr(mode, 'u')) compress_level = -2;
     return compress_level;
 }
-static BGZF *bgzf_write_init(const char *mode)
+static BZSTDF *bzstdf_write_init(const char *mode)
 {
-    BGZF *fp;
-    fp = (BGZF*)calloc(1, sizeof(BGZF));
+    BZSTDF *fp;
+    fp = (BZSTDF*)calloc(1, sizeof(BZSTDF));
     if (fp == NULL) goto mem_fail;
     fp->is_write = 1;
     int compress_level = mode2level(mode);
@@ -360,9 +452,9 @@ static BGZF *bgzf_write_init(const char *mode)
     }
     fp->is_compressed = 1;
 
-    fp->uncompressed_block = malloc(2 * BGZF_MAX_BLOCK_SIZE);
+    fp->uncompressed_block = malloc(2 * BZSTDF_MAX_BLOCK_SIZE);
     if (fp->uncompressed_block == NULL) goto mem_fail;
-    fp->compressed_block = (char *)fp->uncompressed_block + BGZF_MAX_BLOCK_SIZE;
+    fp->compressed_block = (char *)fp->uncompressed_block + BZSTDF_MAX_BLOCK_SIZE;
 
     fp->compress_level = compress_level < 0? Z_DEFAULT_COMPRESSION : compress_level; // Z_DEFAULT_COMPRESSION==-1
     if (fp->compress_level > 9) fp->compress_level = Z_DEFAULT_COMPRESSION;
@@ -378,7 +470,7 @@ static BGZF *bgzf_write_init(const char *mode)
 
         int ret = deflateInit2(fp->gz_stream, fp->compress_level, Z_DEFLATED, 15|16, 8, Z_DEFAULT_STRATEGY);
         if (ret!=Z_OK) {
-            hts_log_error("Call to deflateInit2 failed: %s", bgzf_zerr(ret, fp->gz_stream));
+            hts_log_error("Call to deflateInit2 failed: %s", bzstdf_zerr(ret, fp->gz_stream));
             goto fail;
         }
     }
@@ -396,19 +488,19 @@ static BGZF *bgzf_write_init(const char *mode)
     return NULL;
 }
 
-BGZF *bgzf_open(const char *path, const char *mode)
+BZSTDF *bzstdf_open(const char *path, const char *mode)
 {
-    BGZF *fp = 0;
+    BZSTDF *fp = 0;
     if (strchr(mode, 'r')) {
         hFILE *fpr;
         if ((fpr = hopen(path, mode)) == 0) return 0;
-        fp = bgzf_read_init(fpr, path);
+        fp = bzstdf_read_init(fpr, path);
         if (fp == 0) { hclose_abruptly(fpr); return NULL; }
         fp->fp = fpr;
     } else if (strchr(mode, 'w') || strchr(mode, 'a')) {
         hFILE *fpw;
         if ((fpw = hopen(path, mode)) == 0) return 0;
-        fp = bgzf_write_init(mode);
+        fp = bzstdf_write_init(mode);
         if (fp == NULL) return NULL;
         fp->fp = fpw;
     }
@@ -418,19 +510,19 @@ BGZF *bgzf_open(const char *path, const char *mode)
     return fp;
 }
 
-BGZF *bgzf_dopen(int fd, const char *mode)
+BZSTDF *bzstdf_dopen(int fd, const char *mode)
 {
-    BGZF *fp = 0;
+    BZSTDF *fp = 0;
     if (strchr(mode, 'r')) {
         hFILE *fpr;
         if ((fpr = hdopen(fd, mode)) == 0) return 0;
-        fp = bgzf_read_init(fpr, NULL);
+        fp = bzstdf_read_init(fpr, NULL);
         if (fp == 0) { hclose_abruptly(fpr); return NULL; } // FIXME this closes fd
         fp->fp = fpr;
     } else if (strchr(mode, 'w') || strchr(mode, 'a')) {
         hFILE *fpw;
         if ((fpw = hdopen(fd, mode)) == 0) return 0;
-        fp = bgzf_write_init(mode);
+        fp = bzstdf_write_init(mode);
         if (fp == NULL) return NULL;
         fp->fp = fpw;
     }
@@ -440,14 +532,14 @@ BGZF *bgzf_dopen(int fd, const char *mode)
     return fp;
 }
 
-BGZF *bgzf_hopen(hFILE *hfp, const char *mode)
+BZSTDF *bzstdf_hopen(hFILE *hfp, const char *mode)
 {
-    BGZF *fp = NULL;
+    BZSTDF *fp = NULL;
     if (strchr(mode, 'r')) {
-        fp = bgzf_read_init(hfp, NULL);
+        fp = bzstdf_read_init(hfp, NULL);
         if (fp == NULL) return NULL;
     } else if (strchr(mode, 'w') || strchr(mode, 'a')) {
-        fp = bgzf_write_init(mode);
+        fp = bzstdf_write_init(mode);
         if (fp == NULL) return NULL;
     }
     else { errno = EINVAL; return 0; }
@@ -458,7 +550,7 @@ BGZF *bgzf_hopen(hFILE *hfp, const char *mode)
 }
 
 #ifdef HAVE_LIBDEFLATE
-int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     if (slen == 0) {
         // EOF block
@@ -515,7 +607,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
 
 #else
 
-int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     uint32_t crc;
     z_stream zs;
@@ -540,7 +632,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
         zs.avail_out = *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH;
         int ret = deflateInit2(&zs, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY); // -15 to disable zlib header/footer
         if (ret!=Z_OK) {
-            hts_log_error("Call to deflateInit2 failed: %s", bgzf_zerr(ret, &zs));
+            hts_log_error("Call to deflateInit2 failed: %s", bzstdf_zerr(ret, &zs));
             return -1;
         }
         if ((ret = deflate(&zs, Z_FINISH)) != Z_STREAM_END) {
@@ -548,7 +640,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
                 deflateEnd(&zs);
                 goto uncomp;
             } else {
-                hts_log_error("Deflate operation failed: %s", bgzf_zerr(ret, ret == Z_DATA_ERROR ? &zs : NULL));
+                hts_log_error("Deflate operation failed: %s", bzstdf_zerr(ret, ret == Z_DATA_ERROR ? &zs : NULL));
             }
             return -1;
         }
@@ -560,7 +652,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
             goto uncomp;
         }
         if ((ret = deflateEnd(&zs)) != Z_OK) {
-            hts_log_error("Call to deflateEnd failed: %s", bgzf_zerr(ret, NULL));
+            hts_log_error("Call to deflateEnd failed: %s", bzstdf_zerr(ret, NULL));
             return -1;
         }
         *dlen = zs.total_out + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
@@ -577,7 +669,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
 }
 #endif // HAVE_LIBDEFLATE
 
-static int bgzf_gzip_compress(BGZF *fp, void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+static int bzstdf_gzip_compress(BZSTDF *fp, void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     uint8_t *dst = (uint8_t*)_dst;
     z_stream *zs = fp->gz_stream;
@@ -588,7 +680,7 @@ static int bgzf_gzip_compress(BGZF *fp, void *_dst, size_t *dlen, const void *sr
     zs->avail_out = *dlen;
     int ret = deflate(zs, flush);
     if (ret == Z_STREAM_ERROR) {
-        hts_log_error("Deflate operation failed: %s", bgzf_zerr(ret, NULL));
+        hts_log_error("Deflate operation failed: %s", bzstdf_zerr(ret, NULL));
         return -1;
     }
     if (zs->avail_in != 0) {
@@ -600,19 +692,19 @@ static int bgzf_gzip_compress(BGZF *fp, void *_dst, size_t *dlen, const void *sr
 }
 
 // Deflate the block in fp->uncompressed_block into fp->compressed_block. Also adds an extra field that stores the compressed block length.
-static int deflate_block(BGZF *fp, int block_length)
+static int deflate_block(BZSTDF *fp, int block_length)
 {
-    size_t comp_size = BGZF_MAX_BLOCK_SIZE;
+    size_t comp_size = BZSTDF_MAX_BLOCK_SIZE;
     int ret;
     if ( !fp->is_gzip )
-        ret = bgzf_compress(fp->compressed_block, &comp_size, fp->uncompressed_block, block_length, fp->compress_level);
+        ret = bzstdf_compress(fp->compressed_block, &comp_size, fp->uncompressed_block, block_length, fp->compress_level);
     else
-        ret = bgzf_gzip_compress(fp, fp->compressed_block, &comp_size, fp->uncompressed_block, block_length, fp->compress_level);
+        ret = bzstdf_gzip_compress(fp, fp->compressed_block, &comp_size, fp->uncompressed_block, block_length, fp->compress_level);
 
     if ( ret != 0 )
     {
         hts_log_debug("Compression error %d", ret);
-        fp->errcode |= BGZF_ERR_ZLIB;
+        fp->errcode |= BZSTDF_ERR_ZLIB;
         return -1;
     }
     fp->block_offset = 0;
@@ -621,7 +713,7 @@ static int deflate_block(BGZF *fp, int block_length)
 
 #ifdef HAVE_LIBDEFLATE
 
-static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
+static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
                            const uint8_t *src, size_t slen,
                            uint32_t expected_crc) {
     struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
@@ -649,7 +741,7 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
 
 #else
 
-static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
+static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
                            const uint8_t *src, size_t slen,
                            uint32_t expected_crc) {
     z_stream zs = {
@@ -664,18 +756,18 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
 
     int ret = inflateInit2(&zs, -15);
     if (ret != Z_OK) {
-        hts_log_error("Call to inflateInit2 failed: %s", bgzf_zerr(ret, &zs));
+        hts_log_error("Call to inflateInit2 failed: %s", bzstdf_zerr(ret, &zs));
         return -1;
     }
     if ((ret = inflate(&zs, Z_FINISH)) != Z_STREAM_END) {
-        hts_log_error("Inflate operation failed: %s", bgzf_zerr(ret, ret == Z_DATA_ERROR ? &zs : NULL));
+        hts_log_error("Inflate operation failed: %s", bzstdf_zerr(ret, ret == Z_DATA_ERROR ? &zs : NULL));
         if ((ret = inflateEnd(&zs)) != Z_OK) {
-            hts_log_warning("Call to inflateEnd failed: %s", bgzf_zerr(ret, NULL));
+            hts_log_warning("Call to inflateEnd failed: %s", bzstdf_zerr(ret, NULL));
         }
         return -1;
     }
     if ((ret = inflateEnd(&zs)) != Z_OK) {
-        hts_log_error("Call to inflateEnd failed: %s", bgzf_zerr(ret, NULL));
+        hts_log_error("Call to inflateEnd failed: %s", bzstdf_zerr(ret, NULL));
         return -1;
     }
     *dlen = *dlen - zs.avail_out;
@@ -691,18 +783,18 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
 #endif // HAVE_LIBDEFLATE
 
 // Inflate the block in fp->compressed_block into fp->uncompressed_block
-static int inflate_block(BGZF* fp, int block_length)
+static int inflate_block(BZSTDF* fp, int block_length)
 {
-    size_t dlen = BGZF_MAX_BLOCK_SIZE;
+    size_t dlen = BZSTDF_MAX_BLOCK_SIZE;
     uint32_t crc = le_to_u32((uint8_t *)fp->compressed_block + block_length-8);
-    int ret = bgzf_uncompress(fp->uncompressed_block, &dlen,
+    int ret = bzstdf_uncompress(fp->uncompressed_block, &dlen,
                               (Bytef*)fp->compressed_block + 18,
                               block_length - 18, crc);
     if (ret < 0) {
         if (ret == -2)
-            fp->errcode |= BGZF_ERR_CRC;
+            fp->errcode |= BZSTDF_ERR_CRC;
         else
-            fp->errcode |= BGZF_ERR_ZLIB;
+            fp->errcode |= BZSTDF_ERR_ZLIB;
         return -1;
     }
 
@@ -712,14 +804,14 @@ static int inflate_block(BGZF* fp, int block_length)
 // Decompress the next part of a non-blocked GZIP file.
 // Return the number of uncompressed bytes read, 0 on EOF, or a negative number on error.
 // Will fill the output buffer unless the end of the GZIP file is reached.
-static int inflate_gzip_block(BGZF *fp)
+static int inflate_gzip_block(BZSTDF *fp)
 {
     // we will set this to true when we detect EOF, so we don't bang against the EOF more than once per call
     int input_eof = 0;
 
     // write to the part of the output buffer after block_offset
     fp->gz_stream->next_out = (Bytef*)fp->uncompressed_block + fp->block_offset;
-    fp->gz_stream->avail_out = BGZF_MAX_BLOCK_SIZE - fp->block_offset;
+    fp->gz_stream->avail_out = BZSTDF_MAX_BLOCK_SIZE - fp->block_offset;
 
     while ( fp->gz_stream->avail_out != 0 ) {
         // until we fill the output buffer (or hit EOF)
@@ -727,13 +819,13 @@ static int inflate_gzip_block(BGZF *fp)
         if ( !input_eof && fp->gz_stream->avail_in == 0 ) {
             // we are out of input data in the buffer. Get more.
             fp->gz_stream->next_in = fp->compressed_block;
-            int ret = hread(fp->fp, fp->compressed_block, BGZF_BLOCK_SIZE);
+            int ret = hread(fp->fp, fp->compressed_block, BZSTDF_BLOCK_SIZE);
             if ( ret < 0 ) {
                 // hread had an error. Pass it on.
                 return ret;
             }
             fp->gz_stream->avail_in = ret;
-            if ( fp->gz_stream->avail_in < BGZF_BLOCK_SIZE ) {
+            if ( fp->gz_stream->avail_in < BZSTDF_BLOCK_SIZE ) {
                 // we have reached EOF but the decompressor hasn't necessarily
                 input_eof = 1;
             }
@@ -745,8 +837,8 @@ static int inflate_gzip_block(BGZF *fp)
 
         if ( (ret < 0 && ret != Z_BUF_ERROR) || ret == Z_NEED_DICT ) {
             // an error occurred, other than running out of space
-            hts_log_error("Inflate operation failed: %s", bgzf_zerr(ret, ret == Z_DATA_ERROR ? fp->gz_stream : NULL));
-            fp->errcode |= BGZF_ERR_ZLIB;
+            hts_log_error("Inflate operation failed: %s", bzstdf_zerr(ret, ret == Z_DATA_ERROR ? fp->gz_stream : NULL));
+            fp->errcode |= BZSTDF_ERR_ZLIB;
             return -1;
         } else if ( ret == Z_STREAM_END ) {
             // we finished a GZIP member
@@ -757,8 +849,8 @@ static int inflate_gzip_block(BGZF *fp)
                 // there is more data; try and read another GZIP member in the remaining data
                 int reset_ret = inflateReset(fp->gz_stream);
                 if (reset_ret != Z_OK) {
-                    hts_log_error("Call to inflateReset failed: %s", bgzf_zerr(reset_ret, NULL));
-                    fp->errcode |= BGZF_ERR_ZLIB;
+                    hts_log_error("Call to inflateReset failed: %s", bzstdf_zerr(reset_ret, NULL));
+                    fp->errcode |= BZSTDF_ERR_ZLIB;
                     return -1;
                 }
             } else {
@@ -769,16 +861,16 @@ static int inflate_gzip_block(BGZF *fp)
         } else if ( ret == Z_BUF_ERROR && input_eof && fp->gz_stream->avail_out > 0 ) {
             // the gzip file has ended prematurely
             hts_log_error("Gzip file truncated");
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
     }
 
     // when we get here, the buffer is full or there is an EOF after a complete gzip member
-    return BGZF_MAX_BLOCK_SIZE - fp->gz_stream->avail_out;
+    return BZSTDF_MAX_BLOCK_SIZE - fp->gz_stream->avail_out;
 }
 
-// Returns: 0 on success (BGZF header); -1 on non-BGZF GZIP header; -2 on error
+// Returns: 0 on success (BZSTDF header); -1 on non-BZSTDF GZIP header; -2 on error
 static int check_header(const uint8_t *header)
 {
     if ( header[0] != 31 || header[1] != 139 || header[2] != 8 ) return -2;
@@ -788,18 +880,99 @@ static int check_header(const uint8_t *header)
             && unpackInt16((uint8_t*)&header[14]) == 2) ? 0 : -1;
 }
 
+#ifdef BZSTDF_CACHE
+static void free_cache(BZSTDF *fp)
+{
+    khint_t k;
+    if (fp->is_write) return;
+    khash_t(cache) *h = fp->cache->h;
+    for (k = kh_begin(h); k < kh_end(h); ++k)
+        if (kh_exist(h, k)) free(kh_val(h, k).block);
+    kh_destroy(cache, h);
+    free(fp->cache);
+}
 
-static void free_cache(BGZF *fp) {}
-static int load_block_from_cache(BGZF *fp, int64_t block_address) {return 0;}
-static void cache_block(BGZF *fp, int size) {}
+static int load_block_from_cache(BZSTDF *fp, int64_t block_address)
+{
+    khint_t k;
+    cache_t *p;
+
+    khash_t(cache) *h = fp->cache->h;
+    k = kh_get(cache, h, block_address);
+    if (k == kh_end(h)) return 0;
+    p = &kh_val(h, k);
+    if (fp->block_length != 0) fp->block_offset = 0;
+    fp->block_address = block_address;
+    fp->block_length = p->size;
+    memcpy(fp->uncompressed_block, p->block, p->size);
+    if ( hseek(fp->fp, p->end_offset, SEEK_SET) < 0 )
+    {
+        // todo: move the error up
+        hts_log_error("Could not hseek to %" PRId64, p->end_offset);
+        exit(1);
+    }
+    return p->size;
+}
+
+static void cache_block(BZSTDF *fp, int size)
+{
+    int ret;
+    khint_t k, k_orig;
+    uint8_t *block = NULL;
+    cache_t *p;
+    //fprintf(stderr, "Cache block at %llx\n", (int)fp->block_address);
+    khash_t(cache) *h = fp->cache->h;
+    if (BZSTDF_MAX_BLOCK_SIZE >= fp->cache_size) return;
+    if (fp->block_length < 0 || fp->block_length > BZSTDF_MAX_BLOCK_SIZE) return;
+    if ((kh_size(h) + 1) * BZSTDF_MAX_BLOCK_SIZE > (uint32_t)fp->cache_size) {
+        /* Remove uniformly from any position in the hash by a simple
+         * round-robin approach.  An alternative strategy would be to
+         * remove the least recently accessed block, but the round-robin
+         * removal is simpler and is not expected to have a big impact
+         * on performance */
+        if (fp->cache->last_pos >= kh_end(h)) fp->cache->last_pos = kh_begin(h);
+        k_orig = k = fp->cache->last_pos;
+        if (++k >= kh_end(h)) k = kh_begin(h);
+        while (k != k_orig) {
+            if (kh_exist(h, k))
+                break;
+            if (++k == kh_end(h))
+                k = kh_begin(h);
+        }
+        fp->cache->last_pos = k;
+
+        if (k != k_orig) {
+            block = kh_val(h, k).block;
+            kh_del(cache, h, k);
+        }
+    } else {
+        block = (uint8_t*)malloc(BZSTDF_MAX_BLOCK_SIZE);
+    }
+    if (!block) return;
+    k = kh_put(cache, h, fp->block_address, &ret);
+    if (ret <= 0) { // kh_put failed, or in there already (shouldn't happen)
+        free(block);
+        return;
+    }
+    p = &kh_val(h, k);
+    p->size = fp->block_length;
+    p->end_offset = fp->block_address + size;
+    p->block = block;
+    memcpy(p->block, fp->uncompressed_block, p->size);
+}
+#else
+static void free_cache(BZSTDF *fp) {}
+static int load_block_from_cache(BZSTDF *fp, int64_t block_address) {return 0;}
+static void cache_block(BZSTDF *fp, int size) {}
+#endif
 
 /*
  * Absolute htell in this compressed file.
  *
- * Do not confuse with the external bgzf_tell macro which returns the virtual
+ * Do not confuse with the external bzstdf_tell macro which returns the virtual
  * offset.
  */
-static off_t bgzf_htell(BGZF *fp) {
+static off_t bzstdf_htell(BZSTDF *fp) {
     if (fp->mt) {
         pthread_mutex_lock(&fp->mt->job_pool_m);
         off_t pos = fp->block_address + fp->block_clength;
@@ -810,7 +983,7 @@ static off_t bgzf_htell(BGZF *fp) {
     }
 }
 
-int bgzf_read_block(BGZF *fp)
+int bzstdf_read_block(BZSTDF *fp)
 {
     hts_tpool_result *r;
 
@@ -822,16 +995,16 @@ int bgzf_read_block(BGZF *fp)
             return 0;
         }
         r = hts_tpool_next_result_wait(fp->mt->out_queue);
-        bgzf_job *j = r ? (bgzf_job *)hts_tpool_result_data(r) : NULL;
+        bzstdf_job *j = r ? (bzstdf_job *)hts_tpool_result_data(r) : NULL;
 
-        if (!j || j->errcode == BGZF_ERR_MT) {
+        if (!j || j->errcode == BZSTDF_ERR_MT) {
             if (!fp->mt->free_block) {
-                fp->uncompressed_block = malloc(2 * BGZF_MAX_BLOCK_SIZE);
+                fp->uncompressed_block = malloc(2 * BZSTDF_MAX_BLOCK_SIZE);
                 if (fp->uncompressed_block == NULL) return -1;
-                fp->compressed_block = (char *)fp->uncompressed_block + BGZF_MAX_BLOCK_SIZE;
+                fp->compressed_block = (char *)fp->uncompressed_block + BZSTDF_MAX_BLOCK_SIZE;
             } // else it's already allocated with malloc, maybe even in-use.
             if (mt_destroy(fp->mt) < 0)
-                fp->errcode = BGZF_ERR_IO;
+                fp->errcode = BZSTDF_ERR_IO;
             fp->mt = NULL;
             hts_tpool_delete_result(r, 0);
 
@@ -840,7 +1013,7 @@ int bgzf_read_block(BGZF *fp)
 
         if (j->errcode) {
             fp->errcode = j->errcode;
-            hts_log_error("BGZF decode jobs returned error %d "
+            hts_log_error("BZSTDF decode jobs returned error %d "
                           "for block offset %"PRId64,
                           j->errcode, j->block_address);
             return -1;
@@ -863,17 +1036,17 @@ int bgzf_read_block(BGZF *fp)
             goto again;
         }
 
-        // block_length=0 and block_offset set by bgzf_seek.
+        // block_length=0 and block_offset set by bzstdf_seek.
         if (fp->block_length != 0) fp->block_offset = 0;
         if (!j->hit_eof) fp->block_address = j->block_address;
         fp->block_clength = j->comp_len;
         fp->block_length = j->uncomp_len;
-        // bgzf_read() can change fp->block_length
+        // bzstdf_read() can change fp->block_length
         fp->last_block_eof = (fp->block_length == 0);
 
         if ( j->uncomp_len && j->fp->idx_build_otf )
         {
-            bgzf_index_add_block(j->fp);
+            bzstdf_index_add_block(j->fp);
             j->fp->idx->ublock_addr += j->uncomp_len;
         }
 
@@ -902,18 +1075,18 @@ int bgzf_read_block(BGZF *fp)
     size = 0;
 
     int64_t block_address;
-    block_address = bgzf_htell(fp);
+    block_address = bzstdf_htell(fp);
 
     // Reading an uncompressed file
     if ( !fp->is_compressed )
     {
-        count = hread(fp->fp, fp->uncompressed_block, BGZF_MAX_BLOCK_SIZE);
+        count = hread(fp->fp, fp->uncompressed_block, BZSTDF_MAX_BLOCK_SIZE);
         if (count < 0)  // Error
         {
             hts_log_error("Failed to read uncompressed data "
                           "at offset %"PRId64"%s%s",
                           block_address, errno ? ": " : "", strerror(errno));
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
         else if (count == 0)  // EOF
@@ -935,7 +1108,7 @@ int bgzf_read_block(BGZF *fp)
         {
             hts_log_error("Reading GZIP stream failed at offset %"PRId64,
                           block_address);
-            fp->errcode |= BGZF_ERR_ZLIB;
+            fp->errcode |= BZSTDF_ERR_ZLIB;
             return -1;
         }
         fp->block_length = count;
@@ -944,7 +1117,7 @@ int bgzf_read_block(BGZF *fp)
     }
     if (fp->cache_size && load_block_from_cache(fp, block_address)) return 0;
 
-    // loop to skip empty bgzf blocks
+    // loop to skip empty bzstdf blocks
     while (1)
     {
         count = hread(fp->fp, header, sizeof(header));
@@ -959,18 +1132,18 @@ int bgzf_read_block(BGZF *fp)
         int ret = 0;
         if ( count != sizeof(header) || (ret=check_header(header))==-2 )
         {
-            fp->errcode |= BGZF_ERR_HEADER;
-            hts_log_error("%s BGZF header at offset %"PRId64,
+            fp->errcode |= BZSTDF_ERR_HEADER;
+            hts_log_error("%s BZSTDF header at offset %"PRId64,
                           ret ? "Invalid" : "Failed to read",
                           block_address);
             return -1;
         }
         if ( ret==-1 )
         {
-            // GZIP, not BGZF
+            // GZIP, not BZSTDF
             uint8_t *cblock = (uint8_t*)fp->compressed_block;
             memcpy(cblock, header, sizeof(header));
-            count = hread(fp->fp, cblock+sizeof(header), BGZF_BLOCK_SIZE - sizeof(header)) + sizeof(header);
+            count = hread(fp->fp, cblock+sizeof(header), BZSTDF_BLOCK_SIZE - sizeof(header)) + sizeof(header);
 
             fp->is_gzip = 1;
             fp->gz_stream = (z_stream*) calloc(1,sizeof(z_stream));
@@ -978,8 +1151,8 @@ int bgzf_read_block(BGZF *fp)
             int ret = inflateInit2(fp->gz_stream, 15 + 16);
             if (ret != Z_OK)
             {
-                hts_log_error("Call to inflateInit2 failed: %s", bgzf_zerr(ret, fp->gz_stream));
-                fp->errcode |= BGZF_ERR_ZLIB;
+                hts_log_error("Call to inflateInit2 failed: %s", bzstdf_zerr(ret, fp->gz_stream));
+                fp->errcode |= BZSTDF_ERR_ZLIB;
                 return -1;
             }
             fp->gz_stream->avail_in = count;
@@ -989,7 +1162,7 @@ int bgzf_read_block(BGZF *fp)
             {
                 hts_log_error("Reading GZIP stream failed at offset %"PRId64,
                               block_address);
-                fp->errcode |= BGZF_ERR_ZLIB;
+                fp->errcode |= BZSTDF_ERR_ZLIB;
                 return -1;
             }
             fp->block_length = count;
@@ -1001,9 +1174,9 @@ int bgzf_read_block(BGZF *fp)
         block_length = unpackInt16((uint8_t*)&header[16]) + 1; // +1 because when writing this number, we used "-1"
         if (block_length < BLOCK_HEADER_LENGTH)
         {
-            hts_log_error("Invalid BGZF block length at offset %"PRId64,
+            hts_log_error("Invalid BZSTDF block length at offset %"PRId64,
                           block_address);
-            fp->errcode |= BGZF_ERR_HEADER;
+            fp->errcode |= BZSTDF_ERR_HEADER;
             return -1;
         }
         compressed_block = (uint8_t*)fp->compressed_block;
@@ -1011,37 +1184,37 @@ int bgzf_read_block(BGZF *fp)
         remaining = block_length - BLOCK_HEADER_LENGTH;
         count = hread(fp->fp, &compressed_block[BLOCK_HEADER_LENGTH], remaining);
         if (count != remaining) {
-            hts_log_error("Failed to read BGZF block data at offset %"PRId64
+            hts_log_error("Failed to read BZSTDF block data at offset %"PRId64
                                   " expected %d bytes; hread returned %d",
                           block_address, remaining, count);
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
         size += count;
         if ((count = inflate_block(fp, block_length)) < 0) {
             hts_log_debug("Inflate block operation failed for "
                           "block at offset %"PRId64": %s",
-                          block_address, bgzf_zerr(count, NULL));
-            fp->errcode |= BGZF_ERR_ZLIB;
+                          block_address, bzstdf_zerr(count, NULL));
+            fp->errcode |= BZSTDF_ERR_ZLIB;
             return -1;
         }
         fp->last_block_eof = (count == 0);
-        if ( count ) break;     // otherwise an empty bgzf block
-        block_address = bgzf_htell(fp); // update for new block start
+        if ( count ) break;     // otherwise an empty bzstdf block
+        block_address = bzstdf_htell(fp); // update for new block start
     }
     if (fp->block_length != 0) fp->block_offset = 0; // Do not reset offset if this read follows a seek.
     fp->block_address = block_address;
     fp->block_length = count;
     if ( fp->idx_build_otf )
     {
-        bgzf_index_add_block(fp);
+        bzstdf_index_add_block(fp);
         fp->idx->ublock_addr += count;
     }
     cache_block(fp, size);
     return 0;
 }
 
-ssize_t bgzf_read(BGZF *fp, void *data, size_t length)
+ssize_t bzstdf_read(BZSTDF *fp, void *data, size_t length)
 {
     ssize_t bytes_read = 0;
     uint8_t *output = (uint8_t*)data;
@@ -1051,10 +1224,10 @@ ssize_t bgzf_read(BGZF *fp, void *data, size_t length)
         int copy_length, available = fp->block_length - fp->block_offset;
         uint8_t *buffer;
         if (available <= 0) {
-            int ret = bgzf_read_block(fp);
+            int ret = bzstdf_read_block(fp);
             if (ret != 0) {
                 hts_log_error("Read block operation failed with error %d after %zd of %zu bytes", fp->errcode, bytes_read, length);
-                fp->errcode |= BGZF_ERR_ZLIB;
+                fp->errcode |= BZSTDF_ERR_ZLIB;
                 return -1;
             }
             available = fp->block_length - fp->block_offset;
@@ -1063,14 +1236,14 @@ ssize_t bgzf_read(BGZF *fp, void *data, size_t length)
                     break; // EOF
 
                 // Offset was at end of block (see commit e9863a0)
-                fp->block_address = bgzf_htell(fp);
+                fp->block_address = bzstdf_htell(fp);
                 fp->block_offset = fp->block_length = 0;
                 continue;
             } else if (available < 0) {
                 // Block offset was set to an invalid coordinate
-                hts_log_error("BGZF block offset %d set beyond block size %d",
+                hts_log_error("BZSTDF block offset %d set beyond block size %d",
                               fp->block_offset, fp->block_length);
-                fp->errcode |= BGZF_ERR_MISUSE;
+                fp->errcode |= BZSTDF_ERR_MISUSE;
                 return -1;
             }
         }
@@ -1083,7 +1256,7 @@ ssize_t bgzf_read(BGZF *fp, void *data, size_t length)
 
         // For raw gzip streams this avoids short reads.
         if (fp->block_offset == fp->block_length) {
-            fp->block_address = bgzf_htell(fp);
+            fp->block_address = bzstdf_htell(fp);
             fp->block_offset = fp->block_length = 0;
         }
     }
@@ -1094,12 +1267,12 @@ ssize_t bgzf_read(BGZF *fp, void *data, size_t length)
 }
 
 // -1 for EOF, -2 for error, 0-255 for byte.
-int bgzf_peek(BGZF *fp) {
+int bzstdf_peek(BZSTDF *fp) {
     int available = fp->block_length - fp->block_offset;
     if (available <= 0) {
-        if (bgzf_read_block(fp) < 0) {
+        if (bzstdf_read_block(fp) < 0) {
             hts_log_error("Read block operation failed with error %d", fp->errcode);
-            fp->errcode = BGZF_ERR_ZLIB;
+            fp->errcode = BZSTDF_ERR_ZLIB;
             return -2;
         }
     }
@@ -1110,42 +1283,683 @@ int bgzf_peek(BGZF *fp) {
     return -1;
 }
 
-ssize_t bgzf_raw_read(BGZF *fp, void *data, size_t length)
+ssize_t bzstdf_raw_read(BZSTDF *fp, void *data, size_t length)
 {
     ssize_t ret = hread(fp->fp, data, length);
-    if (ret < 0) fp->errcode |= BGZF_ERR_IO;
+    if (ret < 0) fp->errcode |= BZSTDF_ERR_IO;
     return ret;
 }
 
-int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks)
+#ifdef BZSTDF_MT
+
+/* Function to clean up when jobs are discarded (e.g. during seek)
+ * This works for results too, as results are the same struct with
+ * decompressed data stored in it. */
+static void job_cleanup(void *arg) {
+    bzstdf_job *j = (bzstdf_job *)arg;
+    mtaux_t *mt = j->fp->mt;
+    pthread_mutex_lock(&mt->job_pool_m);
+    pool_free(mt->job_pool, j);
+    pthread_mutex_unlock(&mt->job_pool_m);
+}
+
+static void *bzstdf_encode_func(void *arg) {
+    bzstdf_job *j = (bzstdf_job *)arg;
+
+    j->comp_len = BZSTDF_MAX_BLOCK_SIZE;
+    int ret = bzstdf_compress(j->comp_data, &j->comp_len,
+                            j->uncomp_data, j->uncomp_len,
+                            j->fp->compress_level);
+    if (ret != 0)
+        j->errcode |= BZSTDF_ERR_ZLIB;
+
+    return arg;
+}
+
+// Optimisation for compression level 0 (uncompressed deflate blocks)
+// Avoids memcpy of the data from uncompressed to compressed buffer.
+static void *bzstdf_encode_level0_func(void *arg) {
+    bzstdf_job *j = (bzstdf_job *)arg;
+    uint32_t crc;
+    j->comp_len = j->uncomp_len + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH + 5;
+
+    // Data will have already been copied in to
+    // j->comp_data + BLOCK_HEADER_LENGTH + 5
+
+    // Add preamble
+    memcpy(j->comp_data, g_magic, BLOCK_HEADER_LENGTH);
+    u16_to_le(j->comp_len-1, j->comp_data + 16);
+
+    // Deflate uncompressed data header
+    j->comp_data[BLOCK_HEADER_LENGTH] = 1; // BFINAL=1, BTYPE=00; see RFC1951
+    u16_to_le(j->uncomp_len, j->comp_data + BLOCK_HEADER_LENGTH + 1);
+    u16_to_le(~j->uncomp_len, j->comp_data + BLOCK_HEADER_LENGTH + 3);
+
+    // Trailer (CRC, uncompressed length)
+#ifdef HAVE_LIBDEFLATE
+    crc = libdeflate_crc32(0, j->comp_data + BLOCK_HEADER_LENGTH + 5,
+                           j->uncomp_len);
+#else
+    crc = crc32(crc32(0L, NULL, 0L),
+                (Bytef*)j->comp_data + BLOCK_HEADER_LENGTH + 5, j->uncomp_len);
+#endif
+    u32_to_le(crc, j->comp_data +  j->comp_len - 8);
+    u32_to_le(j->uncomp_len, j->comp_data + j->comp_len - 4);
+
+    return arg;
+}
+
+// Our input block has already been decoded by bzstdf_mt_read_block().
+// We need to split that into a fetch block (compressed) and make this
+// do the actual decompression step.
+static void *bzstdf_decode_func(void *arg) {
+    bzstdf_job *j = (bzstdf_job *)arg;
+
+    j->uncomp_len = BZSTDF_MAX_BLOCK_SIZE;
+    uint32_t crc = le_to_u32((uint8_t *)j->comp_data + j->comp_len-8);
+    int ret = bzstdf_uncompress(j->uncomp_data, &j->uncomp_len,
+                              j->comp_data+18, j->comp_len-18, crc);
+    if (ret != 0)
+        j->errcode |= BZSTDF_ERR_ZLIB;
+
+    return arg;
+}
+
+/*
+ * Nul function so we can dispatch a job with the correct serial
+ * to mark failure or to indicate an empty read (EOF).
+ */
+static void *bzstdf_nul_func(void *arg) { return arg; }
+
+/*
+ * Takes compressed blocks off the results queue and calls hwrite to
+ * punt them to the output stream.
+ *
+ * Returns NULL when no more are left, or -1 on error
+ */
+static void *bzstdf_mt_writer(void *vp) {
+    BZSTDF *fp = (BZSTDF *)vp;
+    mtaux_t *mt = fp->mt;
+    hts_tpool_result *r;
+
+    if (fp->idx_build_otf) {
+        fp->idx->moffs = fp->idx->noffs = 1;
+        fp->idx->offs = (bgzidx1_t*) calloc(fp->idx->moffs, sizeof(bgzidx1_t));
+        if (!fp->idx->offs) goto err;
+    }
+
+    // Iterates until result queue is shutdown, where it returns NULL.
+    while ((r = hts_tpool_next_result_wait(mt->out_queue))) {
+        bzstdf_job *j = (bzstdf_job *)hts_tpool_result_data(r);
+        assert(j);
+
+        if (fp->idx_build_otf) {
+            fp->idx->noffs++;
+            if ( fp->idx->noffs > fp->idx->moffs )
+            {
+                fp->idx->moffs = fp->idx->noffs;
+                kroundup32(fp->idx->moffs);
+                fp->idx->offs = (bgzidx1_t*) realloc(fp->idx->offs, fp->idx->moffs*sizeof(bgzidx1_t));
+                if ( !fp->idx->offs ) goto err;
+            }
+            fp->idx->offs[ fp->idx->noffs-1 ].uaddr = fp->idx->offs[ fp->idx->noffs-2 ].uaddr + j->uncomp_len;
+            fp->idx->offs[ fp->idx->noffs-1 ].caddr = fp->idx->offs[ fp->idx->noffs-2 ].caddr + j->comp_len;
+        }
+
+        // Flush any cached hts_idx_push calls
+        if (bzstdf_idx_flush(fp) < 0)
+            goto err;
+
+        if (hwrite(fp->fp, j->comp_data, j->comp_len) != j->comp_len)
+            goto err;
+
+        // Update our local block_address.  Cannot be fp->block_address due to no
+        // locking in bzstdf_tell.
+        pthread_mutex_lock(&mt->idx_m);
+        mt->block_address += j->comp_len;
+        pthread_mutex_unlock(&mt->idx_m);
+
+        /*
+         * Periodically call hflush (which calls fsync when on a file).
+         * This avoids the fsync being done at the bzstdf_close stage,
+         * which can sometimes cause significant delays.  As this is in
+         * a separate thread, spreading the sync delays throughout the
+         * program execution seems better.
+         * Frequency of 1/512 has been chosen by experimentation
+         * across local XFS, NFS and Lustre tests.
+         */
+        if (++mt->flush_pending % 512 == 0)
+            if (hflush(fp->fp) != 0)
+                goto err;
+
+
+        hts_tpool_delete_result(r, 0);
+
+        // Also updated by main thread
+        pthread_mutex_lock(&mt->job_pool_m);
+        pool_free(mt->job_pool, j);
+        mt->jobs_pending--;
+        pthread_mutex_unlock(&mt->job_pool_m);
+    }
+
+    if (hflush(fp->fp) != 0)
+        goto err;
+
+    hts_tpool_process_destroy(mt->out_queue);
+
+    return NULL;
+
+    err:
+    hts_tpool_process_destroy(mt->out_queue);
+    return (void *)-1;
+}
+
+
+/*
+ * Reads a compressed block of data using hread and dispatches it to
+ * the thread pool for decompression.  This is the analogue of the old
+ * non-threaded bzstdf_read_block() function, but without modifying fp
+ * in any way (except for the read offset).  All output goes via the
+ * supplied bzstdf_job struct.
+ *
+ * Returns NULL when no more are left, or -1 on error
+ */
+int bzstdf_mt_read_block(BZSTDF *fp, bzstdf_job *j)
+{
+    uint8_t header[BLOCK_HEADER_LENGTH], *compressed_block;
+    int count, size = 0, block_length, remaining;
+
+    // NOTE: Guaranteed to be compressed as we block multi-threading in
+    // uncompressed mode.  However it may be gzip compression instead
+    // of bzstdf.
+
+    // Reading compressed file
+    int64_t block_address;
+    block_address = htell(fp->fp);
+
+    if (fp->cache_size && load_block_from_cache(fp, block_address)) return 0;
+    count = hpeek(fp->fp, header, sizeof(header));
+    if (count == 0) // no data read
+        return -1;
+    int ret;
+    if ( count != sizeof(header) || (ret=check_header(header))==-2 )
+    {
+        j->errcode |= BZSTDF_ERR_HEADER;
+        return -1;
+    }
+    if (ret == -1) {
+        j->errcode |= BZSTDF_ERR_MT;
+        return -1;
+    }
+
+    count = hread(fp->fp, header, sizeof(header));
+    if (count != sizeof(header)) // no data read
+        return -1;
+
+    size = count;
+    block_length = unpackInt16((uint8_t*)&header[16]) + 1; // +1 because when writing this number, we used "-1"
+    if (block_length < BLOCK_HEADER_LENGTH) {
+        j->errcode |= BZSTDF_ERR_HEADER;
+        return -1;
+    }
+    compressed_block = (uint8_t*)j->comp_data;
+    memcpy(compressed_block, header, BLOCK_HEADER_LENGTH);
+    remaining = block_length - BLOCK_HEADER_LENGTH;
+    count = hread(fp->fp, &compressed_block[BLOCK_HEADER_LENGTH], remaining);
+    if (count != remaining) {
+        j->errcode |= BZSTDF_ERR_IO;
+        return -1;
+    }
+    size += count;
+    j->comp_len = block_length;
+    j->uncomp_len = BZSTDF_MAX_BLOCK_SIZE;
+    j->block_address = block_address;
+    j->fp = fp;
+    j->errcode = 0;
+
+    return 0;
+}
+
+
+static int bzstdf_check_EOF_common(BZSTDF *fp)
+{
+    uint8_t buf[28];
+    off_t offset = htell(fp->fp);
+    if (hseek(fp->fp, -28, SEEK_END) < 0) {
+        if (errno == ESPIPE) { hclearerr(fp->fp); return 2; }
+#ifdef _WIN32
+        if (errno == EINVAL) { hclearerr(fp->fp); return 2; }
+#else
+        // Assume that EINVAL was due to the file being less than 28 bytes
+        // long, rather than being a random error return from an hfile backend.
+        // This should be reported as "no EOF block" rather than an error.
+        if (errno == EINVAL) { hclearerr(fp->fp); return 0; }
+#endif
+        return -1;
+    }
+    if ( hread(fp->fp, buf, 28) != 28 ) return -1;
+    if ( hseek(fp->fp, offset, SEEK_SET) < 0 ) return -1;
+    return (memcmp("\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", buf, 28) == 0)? 1 : 0;
+}
+
+/*
+ * Checks EOF from the reader thread.
+ */
+static void bzstdf_mt_eof(BZSTDF *fp) {
+    mtaux_t *mt = fp->mt;
+
+    pthread_mutex_lock(&mt->job_pool_m);
+    mt->eof = bzstdf_check_EOF_common(fp);
+    pthread_mutex_unlock(&mt->job_pool_m);
+    mt->command = HAS_EOF_DONE;
+    pthread_cond_signal(&mt->command_c);
+}
+
+
+/*
+ * Performs the seek (called by reader thread).
+ *
+ * This simply drains the entire queue, throwing away blocks, seeks,
+ * and starts it up again.  Brute force, but maybe sufficient.
+ */
+static void bzstdf_mt_seek(BZSTDF *fp) {
+    mtaux_t *mt = fp->mt;
+
+    hts_tpool_process_reset(mt->out_queue, 0);
+    pthread_mutex_lock(&mt->job_pool_m);
+    mt->errcode = 0;
+
+    if (hseek(fp->fp, mt->block_address, SEEK_SET) < 0)
+        mt->errcode = BZSTDF_ERR_IO;
+
+    pthread_mutex_unlock(&mt->job_pool_m);
+    mt->command = SEEK_DONE;
+    pthread_cond_signal(&mt->command_c);
+}
+
+static void *bzstdf_mt_reader(void *vp) {
+    BZSTDF *fp = (BZSTDF *)vp;
+    mtaux_t *mt = fp->mt;
+
+    restart:
+    pthread_mutex_lock(&mt->job_pool_m);
+    bzstdf_job *j = pool_alloc(mt->job_pool);
+    pthread_mutex_unlock(&mt->job_pool_m);
+    if (!j) goto err;
+    j->errcode = 0;
+    j->comp_len = 0;
+    j->uncomp_len = 0;
+    j->hit_eof = 0;
+    j->fp = fp;
+
+    while (bzstdf_mt_read_block(fp, j) == 0) {
+        // Dispatch
+        if (hts_tpool_dispatch3(mt->pool, mt->out_queue, bzstdf_decode_func, j,
+                                job_cleanup, job_cleanup, 0) < 0) {
+            job_cleanup(j);
+            goto err;
+        }
+
+        // Check for command
+        pthread_mutex_lock(&mt->command_m);
+        switch (mt->command) {
+            case SEEK:
+                bzstdf_mt_seek(fp);  // Sets mt->command to SEEK_DONE
+                pthread_mutex_unlock(&mt->command_m);
+                goto restart;
+
+            case HAS_EOF:
+                bzstdf_mt_eof(fp);   // Sets mt->command to HAS_EOF_DONE
+                break;
+
+            case SEEK_DONE:
+            case HAS_EOF_DONE:
+                pthread_cond_signal(&mt->command_c);
+                break;
+
+            case CLOSE:
+                pthread_cond_signal(&mt->command_c);
+                pthread_mutex_unlock(&mt->command_m);
+                hts_tpool_process_destroy(mt->out_queue);
+                return NULL;
+
+            default:
+                break;
+        }
+        pthread_mutex_unlock(&mt->command_m);
+
+        // Allocate buffer for next block
+        pthread_mutex_lock(&mt->job_pool_m);
+        j = pool_alloc(mt->job_pool);
+        pthread_mutex_unlock(&mt->job_pool_m);
+        if (!j) {
+            hts_tpool_process_destroy(mt->out_queue);
+            return NULL;
+        }
+        j->errcode = 0;
+        j->comp_len = 0;
+        j->uncomp_len = 0;
+        j->hit_eof = 0;
+        j->fp = fp;
+    }
+
+    if (j->errcode == BZSTDF_ERR_MT) {
+        // Attempt to multi-thread decode a raw gzip stream cannot be done.
+        // We tear down the multi-threaded decoder and revert to the old code.
+        if (hts_tpool_dispatch3(mt->pool, mt->out_queue, bzstdf_nul_func, j,
+                                job_cleanup, job_cleanup, 0) < 0) {
+            job_cleanup(j);
+            hts_tpool_process_destroy(mt->out_queue);
+            return NULL;
+        }
+        hts_tpool_process_ref_decr(mt->out_queue);
+        return &j->errcode;
+    }
+
+    // Dispatch an empty block so EOF is spotted.
+    // We also use this mechanism for returning errors, in which case
+    // j->errcode is set already.
+
+    j->hit_eof = 1;
+    if (hts_tpool_dispatch3(mt->pool, mt->out_queue, bzstdf_nul_func, j,
+                            job_cleanup, job_cleanup, 0) < 0) {
+        job_cleanup(j);
+        hts_tpool_process_destroy(mt->out_queue);
+        return NULL;
+    }
+    if (j->errcode != 0) {
+        hts_tpool_process_destroy(mt->out_queue);
+        return &j->errcode;
+    }
+
+    // We hit EOF so can stop reading, but we may get a subsequent
+    // seek request.  In this case we need to restart the reader.
+    //
+    // To handle this we wait on a condition variable and then
+    // monitor the command. (This could be either seek or close.)
+    for (;;) {
+        pthread_mutex_lock(&mt->command_m);
+        if (mt->command == NONE)
+            pthread_cond_wait(&mt->command_c, &mt->command_m);
+        switch(mt->command) {
+            default:
+                pthread_mutex_unlock(&mt->command_m);
+                break;
+
+            case SEEK:
+                bzstdf_mt_seek(fp);
+                pthread_mutex_unlock(&mt->command_m);
+                goto restart;
+
+            case HAS_EOF:
+                bzstdf_mt_eof(fp);   // Sets mt->command to HAS_EOF_DONE
+                pthread_mutex_unlock(&mt->command_m);
+                break;
+
+            case SEEK_DONE:
+            case HAS_EOF_DONE:
+                pthread_cond_signal(&mt->command_c);
+                pthread_mutex_unlock(&mt->command_m);
+                break;
+
+            case CLOSE:
+                pthread_cond_signal(&mt->command_c);
+                pthread_mutex_unlock(&mt->command_m);
+                hts_tpool_process_destroy(mt->out_queue);
+                return NULL;
+        }
+    }
+
+    err:
+    pthread_mutex_lock(&mt->command_m);
+    mt->command = CLOSE;
+    pthread_cond_signal(&mt->command_c);
+    pthread_mutex_unlock(&mt->command_m);
+    hts_tpool_process_destroy(mt->out_queue);
+    return NULL;
+}
+
+int bzstdf_thread_pool(BZSTDF *fp, hts_tpool *pool, int qsize) {
+    // No gain from multi-threading when not compressed
+    if (!fp->is_compressed)
+        return 0;
+
+    mtaux_t *mt;
+    mt = (mtaux_t*)calloc(1, sizeof(mtaux_t));
+    if (!mt) return -1;
+    fp->mt = mt;
+
+    mt->pool = pool;
+    mt->n_threads = hts_tpool_size(pool);
+    if (!qsize)
+        qsize = mt->n_threads*2;
+    if (!(mt->out_queue = hts_tpool_process_init(mt->pool, qsize, 0)))
+        goto err;
+    hts_tpool_process_ref_incr(mt->out_queue);
+
+    mt->job_pool = pool_create(sizeof(bzstdf_job));
+    if (!mt->job_pool)
+        goto err;
+
+    pthread_mutex_init(&mt->job_pool_m, NULL);
+    pthread_mutex_init(&mt->command_m, NULL);
+    pthread_mutex_init(&mt->idx_m, NULL);
+    pthread_cond_init(&mt->command_c, NULL);
+    mt->flush_pending = 0;
+    mt->jobs_pending = 0;
+    mt->free_block = fp->uncompressed_block; // currently in-use block
+    mt->block_address = fp->block_address;
+    pthread_create(&mt->io_task, NULL,
+                   fp->is_write ? bzstdf_mt_writer : bzstdf_mt_reader, fp);
+
+    return 0;
+
+    err:
+    free(mt);
+    fp->mt = NULL;
+    return -1;
+}
+
+int bzstdf_mt(BZSTDF *fp, int n_threads, int n_sub_blks)
+{
+    // No gain from multi-threading when not compressed
+    if (!fp->is_compressed || fp->is_gzip)
+        return 0;
+
+    if (n_threads < 1) return -1;
+    hts_tpool *p = hts_tpool_init(n_threads);
+    if (!p)
+        return -1;
+
+    if (bzstdf_thread_pool(fp, p, 0) != 0) {
+        hts_tpool_destroy(p);
+        return -1;
+    }
+
+    fp->mt->own_pool = 1;
+
+    return 0;
+}
+
+static int mt_destroy(mtaux_t *mt)
+{
+    int ret = 0;
+
+    // Tell the reader to shut down
+    pthread_mutex_lock(&mt->command_m);
+    mt->command = CLOSE;
+    pthread_cond_signal(&mt->command_c);
+    hts_tpool_wake_dispatch(mt->out_queue); // unstick the reader
+    pthread_mutex_unlock(&mt->command_m);
+
+    // Check for thread worker failure, indicated by is_shutdown returning 2
+    // It's possible really late errors might be missed, but we can live with
+    // that.
+    ret = -(hts_tpool_process_is_shutdown(mt->out_queue) > 1);
+    // Destroying the queue first forces the writer to exit.
+    // mt->out_queue is reference counted, so destroy gets called in both
+    // this and the IO threads.  The last to do it will clean up.
+    hts_tpool_process_destroy(mt->out_queue);
+
+    // IO thread will now exit.  Wait for it and perform final clean-up.
+    // If it returned non-NULL, it was not happy.
+    void *retval = NULL;
+    pthread_join(mt->io_task, &retval);
+    ret = retval != NULL ? -1 : ret;
+
+    pthread_mutex_destroy(&mt->job_pool_m);
+    pthread_mutex_destroy(&mt->command_m);
+    pthread_mutex_destroy(&mt->idx_m);
+    pthread_cond_destroy(&mt->command_c);
+    if (mt->curr_job)
+        pool_free(mt->job_pool, mt->curr_job);
+
+    if (mt->own_pool)
+        hts_tpool_destroy(mt->pool);
+
+    pool_destroy(mt->job_pool);
+
+    if (mt->idx_cache.e)
+        free(mt->idx_cache.e);
+
+    free(mt);
+    fflush(stderr);
+
+    return ret;
+}
+
+static int mt_queue(BZSTDF *fp)
+{
+    mtaux_t *mt = fp->mt;
+
+    mt->block_number++;
+
+    // Also updated by writer thread
+    pthread_mutex_lock(&mt->job_pool_m);
+    bzstdf_job *j = pool_alloc(mt->job_pool);
+    if (j) mt->jobs_pending++;
+    pthread_mutex_unlock(&mt->job_pool_m);
+    if (!j) return -1;
+
+    j->fp = fp;
+    j->errcode = 0;
+    j->uncomp_len  = fp->block_offset;
+    if (fp->compress_level == 0) {
+        memcpy(j->comp_data + BLOCK_HEADER_LENGTH + 5, fp->uncompressed_block,
+               j->uncomp_len);
+        if (hts_tpool_dispatch3(mt->pool, mt->out_queue,
+                                bzstdf_encode_level0_func, j,
+                                job_cleanup, job_cleanup, 0) < 0) {
+            goto fail;
+        }
+    } else {
+        memcpy(j->uncomp_data, fp->uncompressed_block, j->uncomp_len);
+
+        // Need non-block vers & job_pending?
+        if (hts_tpool_dispatch3(mt->pool, mt->out_queue, bzstdf_encode_func, j,
+                                job_cleanup, job_cleanup, 0) < 0) {
+            goto fail;
+        }
+    }
+
+    fp->block_offset = 0;
+    return 0;
+
+    fail:
+    job_cleanup(j);
+    pthread_mutex_lock(&mt->job_pool_m);
+    mt->jobs_pending--;
+    pthread_mutex_unlock(&mt->job_pool_m);
+    return -1;
+}
+
+static int mt_flush_queue(BZSTDF *fp)
+{
+    mtaux_t *mt = fp->mt;
+
+    // Drain the encoder jobs.
+    // We cannot use hts_tpool_flush here as it can cause deadlock if
+    // the queue is full up of decoder tasks.  The best solution would
+    // be to have one input queue per type of job, but we don't right now.
+    //hts_tpool_flush(mt->pool);
+    pthread_mutex_lock(&mt->job_pool_m);
+    int shutdown = 0;
+    while (mt->jobs_pending != 0) {
+        if ((shutdown = hts_tpool_process_is_shutdown(mt->out_queue)))
+            break;
+        pthread_mutex_unlock(&mt->job_pool_m);
+        usleep(10000); // FIXME: replace by condition variable
+        pthread_mutex_lock(&mt->job_pool_m);
+    }
+    pthread_mutex_unlock(&mt->job_pool_m);
+
+    if (shutdown)
+        return -1;
+
+    // Wait on bzstdf_mt_writer to drain the queue
+    if (hts_tpool_process_flush(mt->out_queue) != 0)
+        return -1;
+
+    return (fp->errcode == 0)? 0 : -1;
+}
+
+static int lazy_flush(BZSTDF *fp)
+{
+    if (fp->mt)
+        return fp->block_offset ? mt_queue(fp) : 0;
+    else
+        return bzstdf_flush(fp);
+}
+
+#else  // ~ #ifdef BZSTDF_MT
+
+int bzstdf_mt(BZSTDF *fp, int n_threads, int n_sub_blks)
 {
     return 0;
 }
 
-static inline int lazy_flush(BGZF *fp)
+static inline int lazy_flush(BZSTDF *fp)
 {
-    return bgzf_flush(fp);
+    return bzstdf_flush(fp);
 }
 
-int bgzf_flush(BGZF *fp)
+#endif // ~ #ifdef BZSTDF_MT
+
+int bzstdf_flush(BZSTDF *fp)
 {
     if (!fp->is_write) return 0;
+#ifdef BZSTDF_MT
+    if (fp->mt) {
+        int ret = 0;
+        if (fp->block_offset) ret = mt_queue(fp);
+        if (!ret) ret = mt_flush_queue(fp);
 
+        // We maintain mt->block_address when threading as the
+        // main code can call bzstdf_tell without any locks.
+        // (The result from tell are wrong, but we only care about the last
+        // 16-bits worth except for the final flush process.
+        pthread_mutex_lock(&fp->mt->idx_m);
+        fp->block_address = fp->mt->block_address;
+        pthread_mutex_unlock(&fp->mt->idx_m);
+
+        return ret;
+    }
+#endif
     while (fp->block_offset > 0) {
         int block_length;
         if ( fp->idx_build_otf )
         {
-            bgzf_index_add_block(fp);
+            bzstdf_index_add_block(fp);
             fp->idx->ublock_addr += fp->block_offset;
         }
         block_length = deflate_block(fp, fp->block_offset);
         if (block_length < 0) {
-            hts_log_debug("Deflate block operation failed: %s", bgzf_zerr(block_length, NULL));
+            hts_log_debug("Deflate block operation failed: %s", bzstdf_zerr(block_length, NULL));
             return -1;
         }
         if (hwrite(fp->fp, fp->compressed_block, block_length) != block_length) {
             hts_log_error("File write failed (wrong size)");
-            fp->errcode |= BGZF_ERR_IO; // possibly truncated file
+            fp->errcode |= BZSTDF_ERR_IO; // possibly truncated file
             return -1;
         }
         fp->block_address += block_length;
@@ -1153,17 +1967,17 @@ int bgzf_flush(BGZF *fp)
     return 0;
 }
 
-int bgzf_flush_try(BGZF *fp, ssize_t size)
+int bzstdf_flush_try(BZSTDF *fp, ssize_t size)
 {
-    if (fp->block_offset + size > BGZF_BLOCK_SIZE) return lazy_flush(fp);
+    if (fp->block_offset + size > BZSTDF_BLOCK_SIZE) return lazy_flush(fp);
     return 0;
 }
 
-ssize_t bgzf_write(BGZF *fp, const void *data, size_t length)
+ssize_t bzstdf_write(BZSTDF *fp, const void *data, size_t length)
 {
     if ( !fp->is_compressed ) {
         size_t push = length + (size_t) fp->block_offset;
-        fp->block_offset = push % BGZF_MAX_BLOCK_SIZE;
+        fp->block_offset = push % BZSTDF_MAX_BLOCK_SIZE;
         fp->block_address += (push - fp->block_offset);
         return hwrite(fp->fp, data, length);
     }
@@ -1173,24 +1987,24 @@ ssize_t bgzf_write(BGZF *fp, const void *data, size_t length)
     assert(fp->is_write);
     while (remaining > 0) {
         uint8_t* buffer = (uint8_t*)fp->uncompressed_block;
-        int copy_length = BGZF_BLOCK_SIZE - fp->block_offset;
+        int copy_length = BZSTDF_BLOCK_SIZE - fp->block_offset;
         if (copy_length > remaining) copy_length = remaining;
         memcpy(buffer + fp->block_offset, input, copy_length);
         fp->block_offset += copy_length;
         input += copy_length;
         remaining -= copy_length;
-        if (fp->block_offset == BGZF_BLOCK_SIZE) {
+        if (fp->block_offset == BZSTDF_BLOCK_SIZE) {
             if (lazy_flush(fp) != 0) return -1;
         }
     }
     return length - remaining;
 }
 
-ssize_t bgzf_block_write(BGZF *fp, const void *data, size_t length)
+ssize_t bzstdf_block_write(BZSTDF *fp, const void *data, size_t length)
 {
     if ( !fp->is_compressed ) {
         size_t push = length + (size_t) fp->block_offset;
-        fp->block_offset = push % BGZF_MAX_BLOCK_SIZE;
+        fp->block_offset = push % BZSTDF_MAX_BLOCK_SIZE;
         fp->block_address += (push - fp->block_offset);
         return hwrite(fp->fp, data, length);
     }
@@ -1202,7 +2016,7 @@ ssize_t bgzf_block_write(BGZF *fp, const void *data, size_t length)
     uint64_t ublock_size; // amount of uncompressed data to be fed into next block
     while (remaining > 0) {
         current_block = fp->idx->moffs - fp->idx->noffs;
-        ublock_size = current_block + 1 < fp->idx->moffs ? fp->idx->offs[current_block+1].uaddr-fp->idx->offs[current_block].uaddr : BGZF_MAX_BLOCK_SIZE;
+        ublock_size = current_block + 1 < fp->idx->moffs ? fp->idx->offs[current_block+1].uaddr-fp->idx->offs[current_block].uaddr : BZSTDF_MAX_BLOCK_SIZE;
         uint8_t* buffer = (uint8_t*)fp->uncompressed_block;
         int copy_length = ublock_size - fp->block_offset;
         if (copy_length > remaining) copy_length = remaining;
@@ -1220,48 +2034,48 @@ ssize_t bgzf_block_write(BGZF *fp, const void *data, size_t length)
 }
 
 
-ssize_t bgzf_raw_write(BGZF *fp, const void *data, size_t length)
+ssize_t bzstdf_raw_write(BZSTDF *fp, const void *data, size_t length)
 {
     ssize_t ret = hwrite(fp->fp, data, length);
-    if (ret < 0) fp->errcode |= BGZF_ERR_IO;
+    if (ret < 0) fp->errcode |= BZSTDF_ERR_IO;
     return ret;
 }
 
 // Helper function for tidying up fp->mt and setting errcode
-static void bgzf_close_mt(BGZF *fp) {
+static void bzstdf_close_mt(BZSTDF *fp) {
     if (fp->mt) {
         if (!fp->mt->free_block)
             fp->uncompressed_block = NULL;
         if (mt_destroy(fp->mt) < 0)
-            fp->errcode = BGZF_ERR_IO;
+            fp->errcode = BZSTDF_ERR_IO;
     }
 }
 
-int bgzf_close(BGZF* fp)
+int bzstdf_close(BZSTDF* fp)
 {
     int ret, block_length;
     if (fp == 0) return -1;
     if (fp->is_write && fp->is_compressed) {
-        if (bgzf_flush(fp) != 0) {
-            bgzf_close_mt(fp);
+        if (bzstdf_flush(fp) != 0) {
+            bzstdf_close_mt(fp);
             return -1;
         }
         fp->compress_level = -1;
         block_length = deflate_block(fp, 0); // write an empty block
         if (block_length < 0) {
-            hts_log_debug("Deflate block operation failed: %s", bgzf_zerr(block_length, NULL));
-            bgzf_close_mt(fp);
+            hts_log_debug("Deflate block operation failed: %s", bzstdf_zerr(block_length, NULL));
+            bzstdf_close_mt(fp);
             return -1;
         }
         if (hwrite(fp->fp, fp->compressed_block, block_length) < 0
             || hflush(fp->fp) != 0) {
             hts_log_error("File write failed");
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
     }
 
-    bgzf_close_mt(fp);
+    bzstdf_close_mt(fp);
 
     if ( fp->is_gzip )
     {
@@ -1269,13 +2083,13 @@ int bgzf_close(BGZF* fp)
         else if (!fp->is_write) ret = inflateEnd(fp->gz_stream);
         else ret = deflateEnd(fp->gz_stream);
         if (ret != Z_OK) {
-            hts_log_error("Call to inflateEnd/deflateEnd failed: %s", bgzf_zerr(ret, NULL));
+            hts_log_error("Call to inflateEnd/deflateEnd failed: %s", bzstdf_zerr(ret, NULL));
         }
         free(fp->gz_stream);
     }
     ret = hclose(fp->fp);
     if (ret != 0) return -1;
-    bgzf_index_destroy(fp);
+    bzstdf_index_destroy(fp);
     free(fp->uncompressed_block);
     free_cache(fp);
     ret = fp->errcode ? -1 : 0;
@@ -1283,27 +2097,27 @@ int bgzf_close(BGZF* fp)
     return ret;
 }
 
-void bgzf_set_cache_size(BGZF *fp, int cache_size)
+void bzstdf_set_cache_size(BZSTDF *fp, int cache_size)
 {
     if (fp && fp->mt) return; // Not appropriate when multi-threading
     if (fp && fp->cache) fp->cache_size = cache_size;
 }
 
-int bgzf_check_EOF(BGZF *fp) {
+int bzstdf_check_EOF(BZSTDF *fp) {
     int has_eof;
 
     if (fp->mt) {
         pthread_mutex_lock(&fp->mt->command_m);
         // fp->mt->command state transitions should be:
         // NONE -> HAS_EOF -> HAS_EOF_DONE -> NONE
-        // (HAS_EOF -> HAS_EOF_DONE happens in bgzf_mt_reader thread)
+        // (HAS_EOF -> HAS_EOF_DONE happens in bzstdf_mt_reader thread)
         if (fp->mt->command != CLOSE)
             fp->mt->command = HAS_EOF;
         pthread_cond_signal(&fp->mt->command_c);
         hts_tpool_wake_dispatch(fp->mt->out_queue);
         do {
             if (fp->mt->command == CLOSE) {
-                // possible error in bgzf_mt_reader
+                // possible error in bzstdf_mt_reader
                 pthread_mutex_unlock(&fp->mt->command_m);
                 return 0;
             }
@@ -1311,7 +2125,7 @@ int bgzf_check_EOF(BGZF *fp) {
             switch (fp->mt->command) {
                 case HAS_EOF_DONE: break;
                 case HAS_EOF:
-                    // Resend signal intended for bgzf_mt_reader()
+                    // Resend signal intended for bzstdf_mt_reader()
                     pthread_cond_signal(&fp->mt->command_c);
                     break;
                 case CLOSE:
@@ -1324,7 +2138,7 @@ int bgzf_check_EOF(BGZF *fp) {
         has_eof = fp->mt->eof;
         pthread_mutex_unlock(&fp->mt->command_m);
     } else {
-        has_eof = bgzf_check_EOF_common(fp);
+        has_eof = bzstdf_check_EOF_common(fp);
     }
 
     fp->no_eof_block = (has_eof == 0);
@@ -1332,7 +2146,7 @@ int bgzf_check_EOF(BGZF *fp) {
     return has_eof;
 }
 
-static inline int64_t bgzf_seek_common(BGZF* fp,
+static inline int64_t bzstdf_seek_common(BZSTDF* fp,
                                        int64_t block_address, int block_offset)
 {
     if (fp->mt) {
@@ -1353,7 +2167,7 @@ static inline int64_t bgzf_seek_common(BGZF* fp,
         fp->mt->hit_eof = 0;
         // fp->mt->command state transitions should be:
         // NONE -> SEEK -> SEEK_DONE -> NONE
-        // (SEEK -> SEEK_DONE happens in bgzf_mt_reader thread)
+        // (SEEK -> SEEK_DONE happens in bzstdf_mt_reader thread)
         fp->mt->command = SEEK;
         fp->mt->block_address = block_address;
         pthread_cond_signal(&fp->mt->command_c);
@@ -1363,7 +2177,7 @@ static inline int64_t bgzf_seek_common(BGZF* fp,
             switch (fp->mt->command) {
                 case SEEK_DONE: break;
                 case SEEK:
-                    // Resend signal intended for bgzf_mt_reader()
+                    // Resend signal intended for bzstdf_mt_reader()
                     pthread_cond_signal(&fp->mt->command_c);
                     break;
                 default:
@@ -1379,7 +2193,7 @@ static inline int64_t bgzf_seek_common(BGZF* fp,
         pthread_mutex_unlock(&fp->mt->command_m);
     } else {
         if (hseek(fp->fp, block_address, SEEK_SET) < 0) {
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
         fp->block_length = 0;  // indicates current block has not been loaded
@@ -1390,15 +2204,15 @@ static inline int64_t bgzf_seek_common(BGZF* fp,
     return 0;
 }
 
-int64_t bgzf_seek(BGZF* fp, int64_t pos, int where)
+int64_t bzstdf_seek(BZSTDF* fp, int64_t pos, int where)
 {
     if (fp->is_write || where != SEEK_SET || fp->is_gzip) {
-        fp->errcode |= BGZF_ERR_MISUSE;
+        fp->errcode |= BZSTDF_ERR_MISUSE;
         return -1;
     }
 
     // This is a flag to indicate we've jumped elsewhere in the stream, to act
-    // as a hint to any other code which is wrapping up bgzf for its own
+    // as a hint to any other code which is wrapping up bzstdf for its own
     // purposes.  We may not be able to tell when seek happens as it can be
     // done on our behalf, eg by the iterator.
     //
@@ -1406,10 +2220,10 @@ int64_t bgzf_seek(BGZF* fp, int64_t pos, int where)
     // responsible for clearing it.
     fp->seeked = pos;
 
-    return bgzf_seek_common(fp, pos >> 16, pos & 0xFFFF);
+    return bzstdf_seek_common(fp, pos >> 16, pos & 0xFFFF);
 }
 
-int bgzf_is_bgzf(const char *fn)
+int bzstdf_is_bzstdf(const char *fn)
 {
     uint8_t buf[16];
     int n;
@@ -1421,12 +2235,12 @@ int bgzf_is_bgzf(const char *fn)
     return check_header(buf) == 0? 1 : 0;
 }
 
-int bgzf_compression(BGZF *fp)
+int bzstdf_compression(BZSTDF *fp)
 {
-    return (!fp->is_compressed)? no_compression : (fp->is_gzip)? gzip : bgzf;
+    return (!fp->is_compressed)? no_compression : (fp->is_gzip)? gzip : bzstdf;
 }
 
-int bgzf_getc(BGZF *fp)
+int bzstdf_getc(BZSTDF *fp)
 {
     if (fp->block_offset+1 < fp->block_length) {
         fp->uncompressed_address++;
@@ -1435,12 +2249,12 @@ int bgzf_getc(BGZF *fp)
 
     int c;
     if (fp->block_offset >= fp->block_length) {
-        if (bgzf_read_block(fp) != 0) return -2; /* error */
+        if (bzstdf_read_block(fp) != 0) return -2; /* error */
         if (fp->block_length == 0) return -1; /* end-of-file */
     }
     c = ((unsigned char*)fp->uncompressed_block)[fp->block_offset++];
     if (fp->block_offset == fp->block_length) {
-        fp->block_address = bgzf_htell(fp);
+        fp->block_address = bzstdf_htell(fp);
         fp->block_offset = 0;
         fp->block_length = 0;
     }
@@ -1448,13 +2262,13 @@ int bgzf_getc(BGZF *fp)
     return c;
 }
 
-int bgzf_getline(BGZF *fp, int delim, kstring_t *str)
+int bzstdf_getline(BZSTDF *fp, int delim, kstring_t *str)
 {
     int l, state = 0;
     str->l = 0;
     do {
         if (fp->block_offset >= fp->block_length) {
-            if (bgzf_read_block(fp) != 0) { state = -2; break; }
+            if (bzstdf_read_block(fp) != 0) { state = -2; break; }
             if (fp->block_length == 0) { state = -1; break; }
         }
         unsigned char *buf = fp->uncompressed_block;
@@ -1466,7 +2280,7 @@ int bgzf_getline(BGZF *fp, int delim, kstring_t *str)
         str->l += l;
         fp->block_offset += l + 1;
         if (fp->block_offset >= fp->block_length) {
-            fp->block_address = bgzf_htell(fp);
+            fp->block_address = bzstdf_htell(fp);
             fp->block_offset = 0;
             fp->block_length = 0;
         }
@@ -1478,7 +2292,7 @@ int bgzf_getline(BGZF *fp, int delim, kstring_t *str)
     return str->l;
 }
 
-void bgzf_index_destroy(BGZF *fp)
+void bzstdf_index_destroy(BZSTDF *fp)
 {
     if ( !fp->idx ) return;
     free(fp->idx->offs);
@@ -1487,16 +2301,16 @@ void bgzf_index_destroy(BGZF *fp)
     fp->idx_build_otf = 0;
 }
 
-int bgzf_index_build_init(BGZF *fp)
+int bzstdf_index_build_init(BZSTDF *fp)
 {
-    bgzf_index_destroy(fp);
+    bzstdf_index_destroy(fp);
     fp->idx = (bgzidx_t*) calloc(1,sizeof(bgzidx_t));
     if ( !fp->idx ) return -1;
     fp->idx_build_otf = 1;  // build index on the fly
     return 0;
 }
 
-int bgzf_index_add_block(BGZF *fp)
+int bzstdf_index_add_block(BZSTDF *fp)
 {
     fp->idx->noffs++;
     if ( fp->idx->noffs > fp->idx->moffs )
@@ -1527,7 +2341,7 @@ static char * get_name_suffix(const char *bname, const char *suffix)
     return buff;
 }
 
-int bgzf_index_dump_hfile(BGZF *fp, struct hFILE *idx, const char *name)
+int bzstdf_index_dump_hfile(BZSTDF *fp, struct hFILE *idx, const char *name)
 {
     // Note that the index contains one extra record when indexing files opened
     // for reading. The terminating record is not present when opened for writing.
@@ -1536,12 +2350,12 @@ int bgzf_index_dump_hfile(BGZF *fp, struct hFILE *idx, const char *name)
     int i;
 
     if (!fp->idx) {
-        hts_log_error("Called for BGZF handle with no index");
+        hts_log_error("Called for BZSTDF handle with no index");
         errno = EINVAL;
         return -1;
     }
 
-    if (bgzf_flush(fp) != 0) return -1;
+    if (bzstdf_flush(fp) != 0) return -1;
 
     // discard the entry marking the end of the file
     if (fp->mt && fp->idx)
@@ -1560,14 +2374,14 @@ int bgzf_index_dump_hfile(BGZF *fp, struct hFILE *idx, const char *name)
     return -1;
 }
 
-int bgzf_index_dump(BGZF *fp, const char *bname, const char *suffix)
+int bzstdf_index_dump(BZSTDF *fp, const char *bname, const char *suffix)
 {
     const char *name = bname, *msg = NULL;
     char *tmp = NULL;
     hFILE *idx = NULL;
 
     if (!fp->idx) {
-        hts_log_error("Called for BGZF handle with no index");
+        hts_log_error("Called for BZSTDF handle with no index");
         errno = EINVAL;
         return -1;
     }
@@ -1585,7 +2399,7 @@ int bgzf_index_dump(BGZF *fp, const char *bname, const char *suffix)
         goto fail;
     }
 
-    if (bgzf_index_dump_hfile(fp, idx, name) != 0) goto fail;
+    if (bzstdf_index_dump_hfile(fp, idx, name) != 0) goto fail;
 
     if (hclose(idx) < 0)
     {
@@ -1613,7 +2427,7 @@ static inline int hread_uint64(uint64_t *xptr, hFILE *f)
     return 0;
 }
 
-int bgzf_index_load_hfile(BGZF *fp, struct hFILE *idx, const char *name)
+int bzstdf_index_load_hfile(BZSTDF *fp, struct hFILE *idx, const char *name)
 {
     fp->idx = (bgzidx_t*) calloc(1,sizeof(bgzidx_t));
     if (fp->idx == NULL) goto fail;
@@ -1644,7 +2458,7 @@ int bgzf_index_load_hfile(BGZF *fp, struct hFILE *idx, const char *name)
     return -1;
 }
 
-int bgzf_index_load(BGZF *fp, const char *bname, const char *suffix)
+int bzstdf_index_load(BZSTDF *fp, const char *bname, const char *suffix)
 {
     const char *name = bname, *msg = NULL;
     char *tmp = NULL;
@@ -1662,7 +2476,7 @@ int bgzf_index_load(BGZF *fp, const char *bname, const char *suffix)
         goto fail;
     }
 
-    if (bgzf_index_load_hfile(fp, idx, name) != 0) goto fail;
+    if (bzstdf_index_load_hfile(fp, idx, name) != 0) goto fail;
 
     if (hclose(idx) != 0) {
         idx = NULL;
@@ -1682,10 +2496,10 @@ int bgzf_index_load(BGZF *fp, const char *bname, const char *suffix)
     return -1;
 }
 
-int bgzf_useek(BGZF *fp, off_t uoffset, int where)
+int bzstdf_useek(BZSTDF *fp, off_t uoffset, int where)
 {
     if (fp->is_write || where != SEEK_SET || fp->is_gzip) {
-        fp->errcode |= BGZF_ERR_MISUSE;
+        fp->errcode |= BZSTDF_ERR_MISUSE;
         return -1;
     }
     if (uoffset >= fp->uncompressed_address - fp->block_offset &&
@@ -1699,14 +2513,14 @@ int bgzf_useek(BGZF *fp, off_t uoffset, int where)
     {
         if (hseek(fp->fp, uoffset, SEEK_SET) < 0)
         {
-            fp->errcode |= BGZF_ERR_IO;
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
         fp->block_length = 0;  // indicates current block has not been loaded
         fp->block_address = uoffset;
         fp->block_offset = 0;
-        if (bgzf_read_block(fp) < 0) {
-            fp->errcode |= BGZF_ERR_IO;
+        if (bzstdf_read_block(fp) < 0) {
+            fp->errcode |= BZSTDF_ERR_IO;
             return -1;
         }
         fp->uncompressed_address = uoffset;
@@ -1715,7 +2529,7 @@ int bgzf_useek(BGZF *fp, off_t uoffset, int where)
 
     if ( !fp->idx )
     {
-        fp->errcode |= BGZF_ERR_IO;
+        fp->errcode |= BZSTDF_ERR_IO;
         return -1;
     }
 
@@ -1729,11 +2543,11 @@ int bgzf_useek(BGZF *fp, off_t uoffset, int where)
         else break;
     }
     int i = ilo-1;
-    if (bgzf_seek_common(fp, fp->idx->offs[i].caddr, 0) < 0)
+    if (bzstdf_seek_common(fp, fp->idx->offs[i].caddr, 0) < 0)
         return -1;
 
-    if ( bgzf_read_block(fp) < 0 ) {
-        fp->errcode |= BGZF_ERR_IO;
+    if ( bzstdf_read_block(fp) < 0 ) {
+        fp->errcode |= BZSTDF_ERR_IO;
         return -1;
     }
     if ( uoffset - fp->idx->offs[i].uaddr > 0 )
@@ -1745,12 +2559,12 @@ int bgzf_useek(BGZF *fp, off_t uoffset, int where)
     return 0;
 }
 
-off_t bgzf_utell(BGZF *fp)
+off_t bzstdf_utell(BZSTDF *fp)
 {
     return fp->uncompressed_address;    // currently maintained only when reading
 }
 
 /* prototype is in hfile_internal.h */
-struct hFILE *bgzf_hfile(struct BGZF *fp) {
+struct hFILE *bzstdf_hfile(struct BZSTDF *fp) {
     return fp->fp;
 }
