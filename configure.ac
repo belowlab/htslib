@@ -273,6 +273,12 @@ dnl Redhat/Fedora has it; Debian/Ubuntu does not.
   static_LIBS="$static_LIBS -lbz2"
 fi
 
+zstd_devel=ok
+AC_CHECK_HEADERS([zstd.h], [], [zstd_devel=header-missing], [;])
+AC_CHECK_LIB([zstd], [ZSTD_compress], [], [zstd_devel=missing])
+pc_requires="$pc_requires libzstd"
+static_LIBS="$static_LIBS -lzstd
+
 if test "$enable_lzma" != no; then
   lzma_devel=ok
   AC_CHECK_HEADERS([lzma.h], [], [lzma_devel=header-missing], [;])
