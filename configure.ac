@@ -97,6 +97,11 @@ AC_ARG_ENABLE([libcurl],
                   [enable libcurl-based support for http/https/etc URLs])],
   [], [enable_libcurl=check])
 
+AC_ARG_ENABLE([lzstd],
+  [AS_HELP_STRING([--enable-lzstd],
+                  [enable support for zstd, allowing build of bzstd])],
+  [], [enable_lzstd=no])
+
 AC_ARG_ENABLE([lzma],
   [AS_HELP_STRING([--disable-lzma],
                   [omit support for LZMA-compressed CRAM files])],
@@ -273,11 +278,16 @@ dnl Redhat/Fedora has it; Debian/Ubuntu does not.
   static_LIBS="$static_LIBS -lbz2"
 fi
 
-zstd_devel=ok
-AC_CHECK_HEADERS([zstd.h], [], [zstd_devel=header-missing], [;])
-AC_CHECK_LIB([zstd], [ZSTD_compress], [], [zstd_devel=missing])
-pc_requires="$pc_requires libzstd"
-static_LIBS="$static_LIBS -lzstd
+if test "$enable_lzstd" != no; then
+    zstd_devel=ok
+    AC_CHECK_HEADERS([zstd.h], [], [zstd_devel=header-missing], [;])
+    AC_CHECK_LIB([zstd], [ZSTD_compress], [], [zstd_devel=missing])
+    if test zstd_devel = missing; then
+MSG_ERROR([cannot find lzstd])
+    fi
+    pc_requires="$pc_requires libzstd"
+    static_LIBS="$static_LIBS -lzstd"
+fi
 
 if test "$enable_lzma" != no; then
   lzma_devel=ok
