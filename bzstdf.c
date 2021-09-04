@@ -3,6 +3,7 @@
    Copyright (c) 2008 Broad Institute / Massachusetts Institute of Technology
                  2011, 2012 Attractive Chaos <attractor@live.co.uk>
    Copyright (C) 2009, 2013-2021 Genome Research Ltd
+   Copyright (c) 2021 Vanderbilt University Medical Center
 
    Permission is hereby granted, free of charge, to any person obtaining a copy
    of this software and associated documentation files (the "Software"), to deal
@@ -36,10 +37,6 @@
 #include <sys/types.h>
 #include <inttypes.h>
 #include <zlib.h>
-
-#ifdef HAVE_LIBDEFLATE
-#include <libdeflate.h>
-#endif
 
 #define HAVE_LIBZSTD
 #ifdef HAVE_LIBZSTD
@@ -554,64 +551,6 @@ BZSTDF *bzstdf_hopen(hFILE *hfp, const char *mode)
     return fp;
 }
 
-#ifdef HAVE_LIBDEFLATE
-int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
-{
-    if (slen == 0) {
-        // EOF block
-        if (*dlen < 28) return -1;
-        memcpy(_dst, "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", 28);
-        *dlen = 28;
-        return 0;
-    }
-
-    uint8_t *dst = (uint8_t*)_dst;
-
-    if (level == 0) {
-        // Uncompressed data
-        if (*dlen < slen+5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) return -1;
-        dst[BLOCK_HEADER_LENGTH] = 1; // BFINAL=1, BTYPE=00; see RFC1951
-        u16_to_le(slen,  &dst[BLOCK_HEADER_LENGTH+1]); // length
-        u16_to_le(~slen, &dst[BLOCK_HEADER_LENGTH+3]); // ones-complement length
-        memcpy(dst + BLOCK_HEADER_LENGTH+5, src, slen);
-        *dlen = slen+5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-
-    } else {
-        level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
-        // NB levels go up to 12 here.
-        struct libdeflate_compressor *z = libdeflate_alloc_compressor(level);
-        if (!z) return -1;
-
-        // Raw deflate
-        size_t clen =
-            libdeflate_deflate_compress(z, src, slen,
-                                        dst + BLOCK_HEADER_LENGTH,
-                                        *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
-
-        if (clen <= 0) {
-            hts_log_error("Call to libdeflate_deflate_compress failed");
-            libdeflate_free_compressor(z);
-            return -1;
-        }
-
-        *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-
-        libdeflate_free_compressor(z);
-    }
-
-    // write the header
-    memcpy(dst, g_magic, BLOCK_HEADER_LENGTH); // the last two bytes are a place holder for the length of the block
-    packInt16(&dst[16], *dlen - 1); // write the compressed length; -1 to fit 2 bytes
-
-    // write the footer
-    uint32_t crc = libdeflate_crc32(0, src, slen);
-    packInt32((uint8_t*)&dst[*dlen - 8], crc);
-    packInt32((uint8_t*)&dst[*dlen - 4], slen);
-    return 0;
-}
-
-#else
-
 int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     uint32_t crc;
@@ -635,18 +574,13 @@ int bzstdf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int 
             hts_log_error("Died during zstd compression");
             return -1;
         }
+
+        *dlen = result;
     }
 
-    // write the header
-    memcpy(dst, g_magic, BLOCK_HEADER_LENGTH); // the last two bytes are a place holder for the length of the block
-    packInt16(&dst[16], *dlen - 1); // write the compressed length; -1 to fit 2 bytes
-    // write the footer
-    crc = crc32(crc32(0L, NULL, 0L), (Bytef*)src, slen);
-    packInt32((uint8_t*)&dst[*dlen - 8], crc);
-    packInt32((uint8_t*)&dst[*dlen - 4], slen);
+    // Instead of a header, for zstd we are going to use a metadata (skippable) frame
     return 0;
 }
-#endif // HAVE_LIBDEFLATE
 
 static int bzstdf_gzip_compress(BZSTDF *fp, void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
@@ -690,36 +624,6 @@ static int deflate_block(BZSTDF *fp, int block_length)
     return comp_size;
 }
 
-#ifdef HAVE_LIBDEFLATE
-
-static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
-                           const uint8_t *src, size_t slen,
-                           uint32_t expected_crc) {
-    struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
-    if (!z) {
-        hts_log_error("Call to libdeflate_alloc_decompressor failed");
-        return -1;
-    }
-
-    int ret = libdeflate_deflate_decompress(z, src, slen, dst, *dlen, dlen);
-    libdeflate_free_decompressor(z);
-
-    if (ret != LIBDEFLATE_SUCCESS) {
-        hts_log_error("Inflate operation failed: %d", ret);
-        return -1;
-    }
-
-    uint32_t crc = libdeflate_crc32(0, (unsigned char *)dst, *dlen);
-    if (crc != expected_crc) {
-        hts_log_error("CRC32 checksum mismatch");
-        return -2;
-    }
-
-    return 0;
-}
-
-#else
-
 static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
                            const uint8_t *src, size_t slen,
                            uint32_t expected_crc) {
@@ -759,7 +663,6 @@ static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
 
     return 0;
 }
-#endif // HAVE_LIBDEFLATE
 
 // Inflate the block in fp->compressed_block into fp->uncompressed_block
 static int inflate_block(BZSTDF* fp, int block_length)
@@ -1315,13 +1218,8 @@ static void *bzstdf_encode_level0_func(void *arg) {
     u16_to_le(~j->uncomp_len, j->comp_data + BLOCK_HEADER_LENGTH + 3);
 
     // Trailer (CRC, uncompressed length)
-#ifdef HAVE_LIBDEFLATE
-    crc = libdeflate_crc32(0, j->comp_data + BLOCK_HEADER_LENGTH + 5,
-                           j->uncomp_len);
-#else
     crc = crc32(crc32(0L, NULL, 0L),
                 (Bytef*)j->comp_data + BLOCK_HEADER_LENGTH + 5, j->uncomp_len);
-#endif
     u32_to_le(crc, j->comp_data +  j->comp_len - 8);
     u32_to_le(j->uncomp_len, j->comp_data + j->comp_len - 4);
 

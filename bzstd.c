@@ -211,7 +211,7 @@ int main(int argc, char **argv)
             {
                 char *name = malloc(strlen(argv[optind]) + 5);
                 strcpy(name, argv[optind]);
-                strcat(name, ".gz");
+                strcat(name, ".zst");
                 fp = bzstdf_open(name, is_forced? out_mode : out_mode_exclusive);
                 if (fp == NULL && errno == EEXIST && confirm_overwrite(name))
                     fp = bzstdf_open(name, out_mode);
