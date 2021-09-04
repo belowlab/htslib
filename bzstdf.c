@@ -627,6 +627,7 @@ static int deflate_block(BZSTDF *fp, int block_length)
 static int bzstdf_uncompress(uint8_t *dst, size_t *dlen,
                            const uint8_t *src, size_t slen,
                            uint32_t expected_crc) {
+    // TODO: Replace with zstd decompression
     z_stream zs = {
             .zalloc = NULL,
             .zfree = NULL,
