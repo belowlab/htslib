@@ -283,7 +283,7 @@ if test "$enable_lzstd" != no; then
     AC_CHECK_HEADERS([zstd.h], [], [zstd_devel=header-missing], [;])
     AC_CHECK_LIB([zstd], [ZSTD_compress], [], [zstd_devel=missing])
     if test $zstd_devel = missing; then
-MSG_ERROR([cannot find lzstd])
+MSG_ERROR([lzstd development files not found])
     fi
     pc_requires="$pc_requires libzstd"
     static_LIBS="$static_LIBS -lzstd"
