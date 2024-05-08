@@ -41,6 +41,12 @@
 #include <libdeflate.h>
 #endif
 
+#define HAVE_LIBISAL
+
+#ifdef HAVE_LIBISAL
+#include <isa-l/igzip_lib.h>
+#endif
+
 #include "htslib/hts.h"
 #include "htslib/bgzf.h"
 #include "htslib/hfile.h"
@@ -547,7 +553,84 @@ BGZF *bgzf_hopen(hFILE *hfp, const char *mode)
     return fp;
 }
 
-#ifdef HAVE_LIBDEFLATE
+#ifdef HAVE_LIBISAL
+int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+{
+    if (slen == 0) {
+        // EOF block
+        if (*dlen < 28) return -1;
+        memcpy(_dst, "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", 28);
+        *dlen = 28;
+        return 0;
+    }
+
+    uint8_t *dst = (uint8_t*)_dst;
+
+    // Initialize. Should do this once per thread
+    struct isal_zstream *stream = malloc(sizeof(struct isal_zstream));
+    isal_deflate_stateless_init(stream);
+
+    level = level < ISAL_DEF_MIN_LEVEL ? ISAL_DEF_MAX_LEVEL : level; // -1 means default
+    level = level > ISAL_DEF_MAX_LEVEL ? ISAL_DEF_MAX_LEVEL : level; // Clamp to level 3
+
+    // Allocate level buffer if level 1 or higher
+    switch (level) {
+        case 1:
+            stream->level_buf = malloc(ISAL_DEF_LVL1_DEFAULT);
+            stream->level_buf_size = ISAL_DEF_LVL1_DEFAULT;
+            break;
+        case 2:
+            stream->level_buf = malloc(ISAL_DEF_LVL2_DEFAULT);
+            stream->level_buf_size = ISAL_DEF_LVL2_DEFAULT;
+            break;
+        case 3:
+            stream->level_buf = malloc(ISAL_DEF_LVL3_DEFAULT);
+            stream->level_buf_size = ISAL_DEF_LVL3_DEFAULT;
+            break;
+        case 0:
+        default:
+            stream->level_buf = NULL;
+            stream->level_buf_size = 0;
+    }
+
+    stream->level = level;
+    stream->next_in = src;
+    stream->next_out = dst + BLOCK_HEADER_LENGTH;
+    stream->avail_in = slen;
+    stream->avail_out = *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH;
+    stream->gzip_flag = IGZIP_DEFLATE;
+    stream->end_of_stream = 1;
+
+    int retval = isal_deflate_stateless(stream);
+
+    // TODO: Check errors
+    if (retval > 0) {
+        // Could look up errors from igzip.h
+        hts_log_error("Call to isal_deflate_stateless failed");
+        return -1;
+    }
+
+    // Update dlen for header:
+    hts_log_error("total out is %d, total in is %d, avail_out is %d, original dlen is %d", stream->total_out, stream->total_in, stream->avail_out, *dlen);
+    *dlen = stream->total_out + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+
+    // write the header
+    memcpy(dst, g_magic, BLOCK_HEADER_LENGTH); // the last two bytes are a place holder for the length of the block
+    packInt16(&dst[16], *dlen - 1); // write the compressed length; -1 to fit 2 bytes
+
+    // write the footer
+    uint32_t crc = libdeflate_crc32(0, src, slen);
+    hts_log_error("crc is %d", (int32_t)crc);
+    packInt32((uint8_t*)&dst[*dlen - 8], crc);
+    packInt32((uint8_t*)&dst[*dlen - 4], slen);
+
+    // Cleanup
+    free(stream->level_buf);
+    free(stream);
+
+    return 0;
+}
+#elif defined HAVE_LIBDEFLATE
 int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     if (slen == 0) {
@@ -582,6 +665,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
             libdeflate_deflate_compress(z, src, slen,
                                         dst + BLOCK_HEADER_LENGTH,
                                         *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+        hts_log_error("total out is %d, original dlen is %d", clen, *dlen);
 
         if (clen <= 0) {
             hts_log_error("Call to libdeflate_deflate_compress failed");
@@ -600,6 +684,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
 
     // write the footer
     uint32_t crc = libdeflate_crc32(0, src, slen);
+    hts_log_error("crc is %d", (int32_t)crc);
     packInt32((uint8_t*)&dst[*dlen - 8], crc);
     packInt32((uint8_t*)&dst[*dlen - 4], slen);
     return 0;
@@ -711,7 +796,44 @@ static int deflate_block(BGZF *fp, int block_length)
     return comp_size;
 }
 
-#ifdef HAVE_LIBDEFLATE
+#ifdef HAVE_LIBISAL
+static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
+                           const uint8_t *src, size_t slen,
+                           uint32_t expected_crc) {
+    struct inflate_state *z = malloc(sizeof(struct inflate_state));
+    isal_inflate_init(z);
+
+    z->next_in = src;
+    z->avail_in = slen;
+    z->next_out = dst;
+    z->avail_out = *dlen;
+
+    int ret = isal_inflate_stateless(z);
+    *dlen = z->total_out;
+
+    free(z);
+
+    if (ret != 0) {
+        hts_log_error("Inflate operation failed: %d", ret);
+        return -1;
+    }
+
+//    hts_log_error("%.20s", dst);
+    uint32_t crc = libdeflate_crc32(0, (unsigned char *)dst, *dlen);
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    // Pretend the CRC was OK so the fuzzer doesn't have to get it right
+    crc = expected_crc;
+#endif
+    if (crc != expected_crc) {
+        hts_log_error("CRC32 checksum mismatch");
+        hts_log_error("%du, %du", crc, expected_crc);
+        return -2;
+    }
+
+    return 0;
+}
+
+#elif defined HAVE_LIBDEFLATE
 
 static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
                            const uint8_t *src, size_t slen,
@@ -730,6 +852,7 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
         return -1;
     }
 
+    hts_log_error("%.20s", dst);
     uint32_t crc = libdeflate_crc32(0, (unsigned char *)dst, *dlen);
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     // Pretend the CRC was OK so the fuzzer doesn't have to get it right
@@ -737,6 +860,7 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
 #endif
     if (crc != expected_crc) {
         hts_log_error("CRC32 checksum mismatch");
+        hts_log_error("%du, %du", crc, expected_crc);
         return -2;
     }
 
