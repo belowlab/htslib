@@ -604,14 +604,14 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
     int retval = isal_deflate_stateless(stream);
 
     // TODO: Check errors
-    if (retval > 0) {
+    if (retval != 0) {
         // Could look up errors from igzip.h
         hts_log_error("Call to isal_deflate_stateless failed");
         return -1;
     }
 
     // Update dlen for header:
-    hts_log_error("total out is %d, total in is %d, avail_out is %d, original dlen is %d", stream->total_out, stream->total_in, stream->avail_out, *dlen);
+//    hts_log_error("total out is %d, total in is %d, avail_out is %d, original dlen is %d", stream->total_out, stream->total_in, stream->avail_out, *dlen);
     *dlen = stream->total_out + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
 
     // write the header
@@ -620,7 +620,7 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
 
     // write the footer
     uint32_t crc = libdeflate_crc32(0, src, slen);
-    hts_log_error("crc is %d", (int32_t)crc);
+//    hts_log_error("crc is %d", (int32_t)crc);
     packInt32((uint8_t*)&dst[*dlen - 8], crc);
     packInt32((uint8_t*)&dst[*dlen - 4], slen);
 
